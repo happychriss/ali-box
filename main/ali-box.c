@@ -87,7 +87,7 @@ static lv_display_t *lvgl_disp = NULL;
 static lv_indev_t *lvgl_touch_indev = NULL;
 
 /* IRQ semaphore for CST816S (per component README) */
-static SemaphoreHandle_t touch_mux = NULL;
+static SemaphoreHandle_t touch_irq_sem = NULL;
 
 /* Forward declarations */
 static esp_err_t app_lcd_init(void);
@@ -95,8 +95,8 @@ static esp_err_t app_touch_init(void);
 static esp_err_t app_lvgl_init(void);
 static void app_main_display(void);
 static void app_runtime_diag_task(void *arg);
-static esp_err_t app_lcd_apply_gap_for_rotation(lv_disp_rotation_t rot);
-static void app_apply_rotation(lv_disp_rotation_t rot);
+static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot);
+static void app_apply_rotation(lv_display_rotation_t rot);
 
 /* =========================================================
  * TOUCH ISR CALLBACK (CST816S README)
@@ -104,9 +104,9 @@ static void app_apply_rotation(lv_disp_rotation_t rot);
 static void touch_isr_callback(esp_lcd_touch_handle_t tp)
 {
     (void)tp;
-    if (touch_mux) {
+    if (touch_irq_sem) {
         BaseType_t high_task_wake = pdFALSE;
-        xSemaphoreGiveFromISR(touch_mux, &high_task_wake);
+        xSemaphoreGiveFromISR(touch_irq_sem, &high_task_wake);
         if (high_task_wake) {
             portYIELD_FROM_ISR();
         }
@@ -124,12 +124,12 @@ static void app_lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     (void)indev;
     data->state = LV_INDEV_STATE_RELEASED;
 
-    if (!touch_handle || !touch_mux) {
+    if (!touch_handle || !touch_irq_sem) {
         return;
     }
 
     /* Only read I2C after IRQ (CST816S responds briefly post-touch) */
-    if (xSemaphoreTake(touch_mux, 0) == pdTRUE) {
+    if (xSemaphoreTake(touch_irq_sem, 0) == pdTRUE) {
         esp_lcd_touch_read_data(touch_handle);
 
         esp_lcd_touch_point_data_t points[1];
@@ -140,7 +140,7 @@ static void app_lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
             /*
              * IMPORTANT:
              * Report RAW panel-native coordinates here (rotation 0).
-             * LVGL will rotate/map them for widgets based on lv_disp_set_rotation().
+             * LVGL will rotate/map them for widgets based on lv_display_set_rotation().
              */
             data->point.x = points[0].x;
             data->point.y = points[0].y;
@@ -188,11 +188,7 @@ static esp_err_t app_lcd_init(void)
     /* ST7789 panel */
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = EXAMPLE_LCD_GPIO_RST,
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-#else
-        .rgb_endian = LCD_RGB_ENDIAN_RGB,
-#endif
         .bits_per_pixel = EXAMPLE_LCD_BITS_PER_PIXEL,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &lcd_panel));
@@ -305,7 +301,8 @@ static esp_err_t app_lvgl_init(void)
  * ========================================================= */
 static void app_button_cb(lv_event_t *e)
 {
-    lv_disp_rotation_t rot = lv_disp_get_rotation(lvgl_disp);
+    (void)e;
+    lv_display_rotation_t rot = lv_display_get_rotation(lvgl_disp);
     rot = (rot + 1) % 4;  /* 0→1→2→3→0 */
     app_apply_rotation(rot);
     ESP_LOGI(TAG, "[UI] Rotation → %d", (int)rot);
@@ -319,7 +316,6 @@ static void app_main_display(void)
 
     /* Logo */
     lv_obj_t *logo = lv_img_create(scr);
-    LV_IMG_DECLARE(esp_logo);
     lv_img_set_src(logo, &esp_logo);
     lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -356,19 +352,22 @@ void app_main(void)
 {
     esp_log_level_set(TAG, ESP_LOG_INFO);
 
-    /* IRQ semaphore */
-    touch_mux = xSemaphoreCreateBinary();
-    if (touch_mux == NULL) {
+
+#ifdef TOUCH_DISPLAY_DEMO
+
+    touch_irq_sem = xSemaphoreCreateBinary();
+    if (!touch_irq_sem) {
         ESP_LOGE(TAG, "Failed to create touch semaphore");
-        return; // Or handle the error appropriately
+        return;
     }
 
-    app_lcd_init();
-    app_touch_init();
-    app_lvgl_init();
+    if (app_lcd_init() != ESP_OK) return;
+    if (app_touch_init() != ESP_OK) return;
+    if (app_lvgl_init() != ESP_OK) return;
 
     xTaskCreate(app_runtime_diag_task, "diag", 3072, NULL, 1, NULL);
     app_main_display();
+#endif  // TOUCH_DISPLAY_DEMO
 }
 
 
@@ -380,15 +379,16 @@ static void app_runtime_diag_task(void *arg)
     (void)arg;
     while (1) {
         ESP_LOGI(TAG, ".");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
-static esp_err_t app_lcd_apply_gap_for_rotation(lv_disp_rotation_t rot)
+static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot)
 {
     int x_off;
     int y_off;
 
+    /* Gap is a panel RAM-window quirk; we tie it to portrait vs landscape orientation. */
     if (rot == LV_DISPLAY_ROTATION_90 || rot == LV_DISPLAY_ROTATION_270) {
         x_off = EXAMPLE_LCD_LANDSCAPE_X_OFFSET;
         y_off = EXAMPLE_LCD_LANDSCAPE_Y_OFFSET;
@@ -401,19 +401,18 @@ static esp_err_t app_lcd_apply_gap_for_rotation(lv_disp_rotation_t rot)
     return esp_lcd_panel_set_gap(lcd_panel, x_off, y_off);
 }
 
-static void app_apply_rotation(lv_disp_rotation_t rot)
+static void app_apply_rotation(lv_display_rotation_t rot)
 {
     if (lvgl_disp == NULL || lcd_panel == NULL) {
         return;
     }
 
-    /* Panel gap is a hardware requirement; update it whenever orientation changes. */
     if (app_lcd_apply_gap_for_rotation(rot) != ESP_OK) {
         ESP_LOGW(TAG, "[LCD] set_gap failed for rotation=%d", (int)rot);
     }
 
     /* LVGL will rotate rendering + input mapping automatically. */
-    lv_disp_set_rotation(lvgl_disp, rot);
+    lv_display_set_rotation(lvgl_disp, rot);
 }
 
 static void app_touch_dot_timer_cb(lv_timer_t *t)
