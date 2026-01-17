@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<indexing>
+ <object alt="" name="Bild1" object_type="graphic"/>
+ <object alt="" name="Bild2" object_type="graphic"/>
+ <object alt="" name="Bild3" object_type="graphic"/>
+ <object alt="" name="Bild4" object_type="graphic"/>
+ <paragraph index="37" node_type="writer">Touch IC:</paragraph>
+ <paragraph index="38" node_type="writer">CST816 (with touch version only)</paragraph>
+ <paragraph index="39" node_type="writer">LCD screen parameters:</paragraph>
+ <paragraph index="40" node_type="writer">Display panel: LCD</paragraph>
+ <paragraph index="41" node_type="writer">Display size: 1.9 inches</paragraph>
+ <paragraph index="42" node_type="writer">Display resolution: 170 × 320</paragraph>
+ <paragraph index="43" node_type="writer">Display color: 262K</paragraph>
+ <paragraph index="44" node_type="writer">Display brightness: 500cd/m ²</paragraph>
+ <paragraph index="45" node_type="writer">Contrast ratio: 900:1</paragraph>
+ <paragraph index="46" node_type="writer">Communication interface: SPI</paragraph>
+ <paragraph index="47" node_type="writer">Driver IC: ST789V2</paragraph>
+ <paragraph index="48" node_type="writer">Touch: Supports (only with touch version)</paragraph>
+ <paragraph index="49" node_type="writer">Touch IC: CST816 (with touch version only)</paragraph>
+</indexing>
