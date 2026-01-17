@@ -1,7 +1,8 @@
 dependencies:
-  esp_lcd_touch_cst816s:
-    version: ^1
-  esp_lvgl_port:
-    version: '*'
-  idf: '>=4.4'
-  espressif/esp_lcd_touch_cst816s: ==1.1.1
+  idf: ">=5.5"
+
+  lvgl/lvgl: "^9.0"
+
+  espressif/esp_lvgl_port: "*"
+
+  espressif/esp_lcd_touch_cst816s: "==1.1.1"

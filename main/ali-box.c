@@ -27,6 +27,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lvgl_port.h"
+#include "indev/lv_indev_gesture.h"
 
 /* =========================================================
  * CST816S TOUCH (IRQ-driven read, per component README)
@@ -36,7 +37,7 @@
 /* =========================================================
  * FIXED ROTATION (debugging touch alignment)
  * ========================================================= */
-#define EXAMPLE_FIXED_ROTATION   (LV_DISPLAY_ROTATION_90)
+#define EXAMPLE_DEFAULT_ROTATION   (LV_DISPLAY_ROTATION_90)
 
 /* =========================================================
  * PANEL GAP (RAM OFFSET)
@@ -118,7 +119,7 @@
  */
 #define EXAMPLE_TOUCH_GPIO_RST   (GPIO_NUM_17)   // TP_RST
 
-static const char *TAG = "LCD_TOUCH_EXAMPLE";
+static const char *TAG = "MAIN";
 
 /* Forward declarations (C requires prototypes before first use) */
 static void app_runtime_diag_task(void *arg);
@@ -126,6 +127,15 @@ static esp_err_t app_lcd_apply_gap_for_rotation(lv_disp_rotation_t rot);
 
 /* LVGL image */
 LV_IMG_DECLARE(esp_logo)
+
+static bool     s_touch_active = false;
+static int32_t  s_touch_x = 0;
+static int32_t  s_touch_y = 0;
+static uint32_t s_touch_last_tick = 0;
+
+/* How long we keep a touch "alive" without new IRQ (ms) */
+#define TOUCH_HOLD_TIME_MS  40
+
 
 /* Handles */
 static esp_lcd_panel_io_handle_t lcd_io = NULL;
@@ -135,11 +145,18 @@ static esp_lcd_touch_handle_t touch_handle = NULL;
 static lv_display_t *lvgl_disp = NULL;
 static lv_indev_t *lvgl_touch_indev = NULL;
 
+/* Current UI/display rotation */
+static lv_disp_rotation_t g_disp_rot = EXAMPLE_DEFAULT_ROTATION;
+
 /* Touch visualizer (green dot) */
 static lv_obj_t *touch_dot = NULL;
 static volatile int32_t g_touch_x = 0;
 static volatile int32_t g_touch_y = 0;
 static volatile bool g_touch_pressed = false;
+
+static void app_set_rotation(lv_disp_rotation_t rot);
+static void app_cycle_rotation(void);
+static void app_button_cb(lv_event_t *e);
 
 /* =========================================================
  * DEBUG HELPERS
@@ -419,9 +436,9 @@ static esp_err_t app_touch_init(void)
             .interrupt = 0,
         },
         .flags = {
-            .swap_xy = 1,
+            .swap_xy = 0,
             .mirror_x = 0,
-            .mirror_y = 1,
+            .mirror_y = 0,
         },
     };
 
@@ -463,31 +480,54 @@ static void app_lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         return;
     }
 
-    if (xSemaphoreTake(touch_mux, 0) == pdTRUE) {
-        esp_lcd_touch_read_data(touch_handle);
+    bool got_irq = (xSemaphoreTake(touch_mux, 0) == pdTRUE);
+    uint32_t now = lv_tick_get();
+
+    if (got_irq) {
+        /* Controller signaled new data is ready */
+        if (esp_lcd_touch_read_data(touch_handle) == ESP_OK) {
+
+            esp_lcd_touch_point_data_t points[1];
+            uint8_t point_cnt = 0;
+
+            if (esp_lcd_touch_get_data(touch_handle, points, &point_cnt, 1) == ESP_OK &&
+                point_cnt > 0) {
+
+                int32_t x = points[0].x;
+                int32_t y = points[0].y;
+
+                int32_t tx = x;
+                int32_t ty = y;
+                /* Cache */
+                s_touch_active    = true;
+                s_touch_x         = tx;
+                s_touch_y         = ty;
+                s_touch_last_tick = now;
+            } else {
+                /* Controller explicitly reports no touch */
+                s_touch_active = false;
+            }
+        }
     }
 
-    esp_lcd_touch_point_data_t points[1];
-    uint8_t point_cnt = 0;
-    esp_err_t err = esp_lcd_touch_get_data(touch_handle, points, &point_cnt, 1);
-    if (err == ESP_OK && point_cnt > 0) {
-        data->state = LV_INDEV_STATE_PRESSED;
+    /* Sustain touch across LVGL ticks */
+    if (s_touch_active &&
+        (now - s_touch_last_tick) <= TOUCH_HOLD_TIME_MS) {
 
-        /* Raw touch coordinates as reported by esp_lcd_touch (already includes tp_cfg flags) */
-        int32_t x = points[0].x;
-        int32_t y = points[0].y;
+        data->state   = LV_INDEV_STATE_PRESSED;
+        data->point.x = s_touch_x;
+        data->point.y = s_touch_y;
 
-        /* For this debug build: keep one fixed display rotation, so no per-rotation transform here. */
-        data->point.x = x;
-        data->point.y = y;
-
-        /* Update shared state for the green dot renderer (no LVGL calls from input callback). */
-        g_touch_x = x;
-        g_touch_y = y;
         g_touch_pressed = true;
-    } else {
-        g_touch_pressed = false;
+        g_touch_x = data->point.x;
+        g_touch_y = data->point.y;
+
+        return;
     }
+
+    /* Final release */
+    s_touch_active  = false;
+    g_touch_pressed = false;
 }
 
 
@@ -560,9 +600,10 @@ static esp_err_t app_lvgl_init(void)
         return ESP_FAIL;
     }
 
-    /* Fixed rotation for touch debugging */
-    ESP_RETURN_ON_ERROR(app_lcd_apply_gap_for_rotation(EXAMPLE_FIXED_ROTATION), TAG, "set_gap failed");
-    lv_disp_set_rotation(lvgl_disp, EXAMPLE_FIXED_ROTATION);
+    /* Default rotation at boot */
+    g_disp_rot = EXAMPLE_DEFAULT_ROTATION;
+    ESP_RETURN_ON_ERROR(app_lcd_apply_gap_for_rotation(g_disp_rot), TAG, "set_gap failed");
+    lv_disp_set_rotation(lvgl_disp, g_disp_rot);
 
     ESP_LOGI(TAG, "[LVGL] Display registered: %p", (void *)lvgl_disp);
 
@@ -592,6 +633,7 @@ static void app_touch_dot_timer_cb(lv_timer_t *t)
 
     /* Read shared state produced by input callback */
     const bool pressed = g_touch_pressed;
+
     const int32_t x = g_touch_x;
     const int32_t y = g_touch_y;
 
@@ -635,9 +677,18 @@ static void app_main_display(void)
     lv_label_set_text(
         label,
         LV_SYMBOL_BELL "Hello ST7789 + CST816\n"
-        LV_SYMBOL_WARNING " Touch dot debug (rotation fixed) "
+        LV_SYMBOL_WARNING " Touch dot debug + Rotate "
     );
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 20);
+
+    /* Rotate button (cycles 0/90/180/270) */
+    lv_obj_t *btn = lv_btn_create(scr);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_add_event_cb(btn, app_button_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_label = lv_label_create(btn);
+    lv_label_set_text(btn_label, "Rotate");
+    lv_obj_center(btn_label);
 
     /* Touch visualization dot */
     touch_dot = lv_obj_create(scr);
@@ -688,11 +739,21 @@ void app_main(void)
         /* Touch isn’t required for pixels. Keep going. */
     }
 
+    ESP_LOGI("LVGL",
+         "LVGL version: %d.%d.%d (hex: 0x%06X)",
+         LVGL_VERSION_MAJOR,
+         LVGL_VERSION_MINOR,
+         LVGL_VERSION_PATCH
+         );
+
+
     err = app_lvgl_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "LVGL init failed: %s", esp_err_to_name(err));
         return;
     }
+
+
 
     app_main_display();
     ESP_LOGI(TAG, "=== app_main done (UI created) ===");
@@ -729,3 +790,93 @@ static esp_err_t app_lcd_apply_gap_for_rotation(lv_disp_rotation_t rot)
     return esp_lcd_panel_set_gap(lcd_panel, x_off, y_off);
 }
 
+/* =========================================================
+ * ROTATION HELPERS
+ * ========================================================= */
+static void app_set_rotation(lv_disp_rotation_t rot)
+{
+    /* Defensive: display not ready yet */
+    if (lvgl_disp == NULL) {
+        return;
+    }
+
+    /* Normalize rotation enum (safety for callers) */
+    if (rot > LV_DISPLAY_ROTATION_270) {
+        rot = LV_DISPLAY_ROTATION_0;
+    }
+
+    /*
+     * 1) Apply ST7789 RAM window offset ("gap")
+     *
+     * This is a *panel hardware requirement*, not an LVGL feature.
+     * It must be updated whenever orientation changes, otherwise the
+     * image will appear shifted or clipped.
+     */
+    if (app_lcd_apply_gap_for_rotation(rot) != ESP_OK) {
+        ESP_LOGW(TAG, "[LCD] set_gap failed for rotation=%d", (int)rot);
+    }
+
+    /*
+     * 2) Update LVGL display rotation
+     *
+     * This rotates:
+     *  - rendering
+     *  - widget layout
+     *  - hit-testing
+     *
+     * LVGL APIs must be serialized with the LVGL task.
+     */
+    lvgl_port_lock(0);
+    lv_disp_set_rotation(lvgl_disp, rot);
+
+    /*
+     * 3) Update LVGL input-device rotation
+     *
+     * CRITICAL:
+     * Without this, pointer direction will feel inverted
+     * ("plus/minus swapped") after rotation.
+     *
+     * This tells LVGL how to interpret incoming touch coordinates
+     * relative to the rotated display.
+     */
+
+    lvgl_port_unlock();
+
+    /*
+     * 4) Store current rotation for application-level state
+     *
+     * Note:
+     * Touch code does NOT use this for math anymore.
+     * It is only used for cycling / logging.
+     */
+    g_disp_rot = rot;
+
+    ESP_LOGI(TAG, "[UI] Rotation set to %d", (int)rot);
+}
+
+static void app_cycle_rotation(void)
+{
+    lv_disp_rotation_t next = g_disp_rot;
+    switch (g_disp_rot) {
+        case LV_DISPLAY_ROTATION_0:
+            next = LV_DISPLAY_ROTATION_90;
+            break;
+        case LV_DISPLAY_ROTATION_90:
+            next = LV_DISPLAY_ROTATION_180;
+            break;
+        case LV_DISPLAY_ROTATION_180:
+            next = LV_DISPLAY_ROTATION_270;
+            break;
+        case LV_DISPLAY_ROTATION_270:
+        default:
+            next = LV_DISPLAY_ROTATION_0;
+            break;
+    }
+    app_set_rotation(next);
+}
+
+static void app_button_cb(lv_event_t *e)
+{
+    (void)e;
+    app_cycle_rotation();
+}
