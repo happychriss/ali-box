@@ -163,6 +163,44 @@ esp_err_t hdc2080_set_humidity_offset_adjust(const hdc2080_t *s, uint8_t value, 
     return out_new ? hdc2080_read_humidity_offset_adjust(s, out_new) : ESP_OK;
 }
 
+esp_err_t hdc2080_enable_threshold_interrupt(const hdc2080_t *s, HDC2080_InterruptMode mode)
+{
+    uint8_t v = 0;  // Start clean
+
+    switch (mode) {
+    case HDC2080_TEMP_ONLY:
+        v = 0x60;  // TH_EN(0x40) + TL_EN(0x20)
+        break;
+    case HDC2080_HUMID_ONLY:
+        v = 0x18;  // HH_EN(0x10) + HL_EN(0x08)
+        break;
+    case HDC2080_TEMP_AND_HUMID:
+        v = 0x78;  // All four
+        break;
+    }
+
+    return hdc2080_write_reg(s, 0x07, v);  // HDC2080_INT_CONFIG
+}
+
+// After config, kickstart AMM:
+esp_err_t hdc2080_start_auto_measurement(const hdc2080_t *s)
+{
+    uint8_t meas;
+    hdc2080_read_reg(s, 0x0F, &meas);
+    meas |= 0x01;  // MEAS_TRIG_START
+    return hdc2080_write_reg(s, 0x0F, meas);
+}
+
+
+esp_err_t hdc2080_disable_threshold_interrupt(const hdc2080_t *s)
+{
+    uint8_t v;
+    esp_err_t err = hdc2080_read_reg(s, HDC2080_REG_INTERRUPT_CONFIG, &v);
+    if (err != ESP_OK) return err;
+    v &= ~((1 << 6) | (1 << 5) | (1 << 4) | (1 << 3));
+    return hdc2080_write_reg(s, HDC2080_REG_INTERRUPT_CONFIG, v);
+}
+
 esp_err_t hdc2080_enable_heater(const hdc2080_t *s)
 {
     uint8_t cfg;
@@ -415,40 +453,4 @@ esp_err_t hdc2080_read_max_humidity(const hdc2080_t *s, float *out)
     if (err != ESP_OK) return err;
     *out = ((float)v / 256.0f) * 100.0f;
     return ESP_OK;
-}
-
-esp_err_t hdc2080_enable_threshold_interrupt(const hdc2080_t *s)
-{
-    uint8_t v;
-    esp_err_t err = hdc2080_read_reg(s, HDC2080_REG_INTERRUPT_CONFIG, &v);
-    if (err != ESP_OK) return err;
-    v |= 0x78;
-    return hdc2080_write_reg(s, HDC2080_REG_INTERRUPT_CONFIG, v);
-}
-
-esp_err_t hdc2080_disable_threshold_interrupt(const hdc2080_t *s)
-{
-    uint8_t v;
-    esp_err_t err = hdc2080_read_reg(s, HDC2080_REG_INTERRUPT_CONFIG, &v);
-    if (err != ESP_OK) return err;
-    v &= 0x87;
-    return hdc2080_write_reg(s, HDC2080_REG_INTERRUPT_CONFIG, v);
-}
-
-esp_err_t hdc2080_enable_drdy_interrupt(const hdc2080_t *s)
-{
-    uint8_t v;
-    esp_err_t err = hdc2080_read_reg(s, HDC2080_REG_INTERRUPT_CONFIG, &v);
-    if (err != ESP_OK) return err;
-    v |= 0x80;
-    return hdc2080_write_reg(s, HDC2080_REG_INTERRUPT_CONFIG, v);
-}
-
-esp_err_t hdc2080_disable_drdy_interrupt(const hdc2080_t *s)
-{
-    uint8_t v;
-    esp_err_t err = hdc2080_read_reg(s, HDC2080_REG_INTERRUPT_CONFIG, &v);
-    if (err != ESP_OK) return err;
-    v &= 0x7F;
-    return hdc2080_write_reg(s, HDC2080_REG_INTERRUPT_CONFIG, v);
 }

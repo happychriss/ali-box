@@ -1,4 +1,4 @@
- #pragma once
+#pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -42,10 +42,16 @@ typedef struct {
 #define HDC2080_REG_HUMID_THR_H        0x0D
 #define HDC2080_REG_CONFIG             0x0E
 #define HDC2080_REG_MEASUREMENT_CONFIG 0x0F
-#define HDC2080_REG_MID_L              0xFC
-#define HDC2080_REG_MID_H              0xFD
-#define HDC2080_REG_DEVICE_ID_L        0xFE
-#define HDC2080_REG_DEVICE_ID_H        0xFF
+#define HDC2080_REG_MANUFACTURER_ID_LOW 0xFC
+#define HDC2080_REG_MANUFACTURER_ID_HIGH 0xFD
+#define HDC2080_REG_DEVICE_ID_LOW        0xFE
+#define HDC2080_REG_DEVICE_ID_HIGH        0xFF
+
+typedef enum {
+    HDC2080_TEMP_AND_HUMID = 0,
+    HDC2080_TEMP_ONLY      = 1,
+    HDC2080_HUMID_ONLY     = 2,
+} HDC2080_InterruptMode;
 
 /* Arduino-style enums */
 enum {
@@ -54,11 +60,6 @@ enum {
     HDC2080_FOURTEEN_BIT = 2,
 };
 
-enum {
-    HDC2080_TEMP_AND_HUMID = 0,
-    HDC2080_TEMP_ONLY      = 1,
-    HDC2080_HUMID_ONLY     = 2,
-};
 
 enum {
     HDC2080_MANUAL      = 0,
@@ -103,6 +104,9 @@ esp_err_t hdc2080_set_temp_offset_adjust(const hdc2080_t *s, uint8_t value, uint
 esp_err_t hdc2080_read_humidity_offset_adjust(const hdc2080_t *s, uint8_t *out);
 esp_err_t hdc2080_set_humidity_offset_adjust(const hdc2080_t *s, uint8_t value, uint8_t *out_new);
 
+esp_err_t hdc2080_enable_threshold_interrupt(const hdc2080_t *s, HDC2080_InterruptMode mode);
+esp_err_t hdc2080_disable_threshold_interrupt(const hdc2080_t *s);
+
 esp_err_t hdc2080_enable_heater(const hdc2080_t *s);
 esp_err_t hdc2080_disable_heater(const hdc2080_t *s);
 
@@ -136,10 +140,10 @@ esp_err_t hdc2080_clear_max_humidity(const hdc2080_t *s);
 esp_err_t hdc2080_read_max_temp(const hdc2080_t *s, float *out);
 esp_err_t hdc2080_read_max_humidity(const hdc2080_t *s, float *out);
 
-esp_err_t hdc2080_enable_threshold_interrupt(const hdc2080_t *s);
-esp_err_t hdc2080_disable_threshold_interrupt(const hdc2080_t *s);
 esp_err_t hdc2080_enable_drdy_interrupt(const hdc2080_t *s);
 esp_err_t hdc2080_disable_drdy_interrupt(const hdc2080_t *s);
+
+esp_err_t hdc2080_start_auto_measurement(const hdc2080_t *s);
 
 #ifdef __cplusplus
 }
