@@ -30,6 +30,8 @@
 #include <stdio.h>  /* snprintf */
 #include <inttypes.h>
 
+#include "freertos/semphr.h"  /* SemaphoreHandle_t */
+
 /* Image asset */
 LV_IMG_DECLARE(esp_logo);
 
@@ -41,52 +43,52 @@ LV_IMG_DECLARE(esp_logo);
 static const char* TAG = "MAIN";
 
 /* === LCD native resolution (portrait) === */
-#define EXAMPLE_LCD_H_RES   (170)
-#define EXAMPLE_LCD_V_RES   (320)
+#define LCD_H_RES   (170)
+#define LCD_V_RES   (320)
 
 /* === PANEL GAP (RAM window offset) ===
  * This 170x320 ST7789 panel needs a RAM window offset ("gap").
  * Apply a different gap depending on orientation.
  */
-#define EXAMPLE_LCD_PORTRAIT_X_OFFSET  (35)
-#define EXAMPLE_LCD_PORTRAIT_Y_OFFSET  (0)
-#define EXAMPLE_LCD_LANDSCAPE_X_OFFSET (0)
-#define EXAMPLE_LCD_LANDSCAPE_Y_OFFSET (35)
+#define LCD_PORTRAIT_X_OFFSET  (35)
+#define LCD_PORTRAIT_Y_OFFSET  (0)
+#define LCD_LANDSCAPE_X_OFFSET (0)
+#define LCD_LANDSCAPE_Y_OFFSET (35)
 
 /* === LCD SPI settings === */
-#define EXAMPLE_LCD_SPI_NUM          (SPI3_HOST)
-#define EXAMPLE_LCD_PIXEL_CLK_HZ     (26 * 1000 * 1000)
-#define EXAMPLE_LCD_CMD_BITS         (8)
-#define EXAMPLE_LCD_PARAM_BITS       (8)
-#define EXAMPLE_LCD_BITS_PER_PIXEL   (16)
-#define EXAMPLE_LCD_DRAW_BUFF_DOUBLE (1)
-#define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (40)
-#define EXAMPLE_LCD_BL_ON_LEVEL      (0)
+#define LCD_SPI_NUM          (SPI3_HOST)
+#define LCD_PIXEL_CLK_HZ     (26 * 1000 * 1000)
+#define LCD_CMD_BITS         (8)
+#define LCD_PARAM_BITS       (8)
+#define LCD_BITS_PER_PIXEL   (16)
+#define LCD_DRAW_BUFF_DOUBLE (1)
+#define LCD_DRAW_BUFF_HEIGHT (40)
+#define LCD_BL_ON_LEVEL      (0)
 
 /* === LCD pins === */
-#define EXAMPLE_LCD_GPIO_RST     (GPIO_NUM_9)
-#define EXAMPLE_LCD_GPIO_SCLK    (GPIO_NUM_10)
-#define EXAMPLE_LCD_GPIO_DC      (GPIO_NUM_11)
-#define EXAMPLE_LCD_GPIO_CS      (GPIO_NUM_12)
-#define EXAMPLE_LCD_GPIO_MOSI    (GPIO_NUM_13)
-#define EXAMPLE_LCD_GPIO_BL      (GPIO_NUM_14)
+#define LCD_GPIO_RST     (GPIO_NUM_9)
+#define LCD_GPIO_SCLK    (GPIO_NUM_10)
+#define LCD_GPIO_DC      (GPIO_NUM_11)
+#define LCD_GPIO_CS      (GPIO_NUM_12)
+#define LCD_GPIO_MOSI    (GPIO_NUM_13)
+#define LCD_GPIO_BL      (GPIO_NUM_14)
 
 /* === Touch I2C settings === */
-#define EXAMPLE_TOUCH_I2C_NUM        (0)
-#define EXAMPLE_TOUCH_I2C_CLK_HZ     (400000)
-#define EXAMPLE_TOUCH_I2C_SDA        (GPIO_NUM_47)
-#define EXAMPLE_TOUCH_I2C_SCL        (GPIO_NUM_48)
-#define EXAMPLE_TOUCH_GPIO_INT       (GPIO_NUM_21)
+#define TOUCH_I2C_NUM        (0)
+#define TOUCH_I2C_CLK_HZ     (400000)
+#define TOUCH_I2C_SDA        (GPIO_NUM_47)
+#define TOUCH_I2C_SCL        (GPIO_NUM_48)
+#define TOUCH_GPIO_INT       (GPIO_NUM_21)
 
 /* === HDC2080 settings === */
 #define HDC2080_ADDR 0x40
-#define EXAMPLE_HDC2080_IRQ  (GPIO_NUM_15)
-#define EXAMPLE_TEMP_DELTA_WAKE_C    (0.5f)
-#define EXAMPLE_DISPLAY_ON_MS        (3000)
+#define HDC2080_IRQ  (GPIO_NUM_15)
+#define TEMP_DELTA_WAKE_C    (2.f)
+#define DISPLAY_ON_MS        (3000)
 
 /* Wake sources
- * Touch IRQ is on GPIO21 (EXAMPLE_TOUCH_GPIO_INT).
- * HDC2080 IRQ is on GPIO18 (EXAMPLE_HDC2080_IRQ).
+ * Touch IRQ is on GPIO21 (TOUCH_GPIO_INT).
+ * HDC2080 IRQ is on GPIO15 (HDC2080_IRQ).
  * Both can be configured as GPIO deep-sleep wake sources.
  */
 
@@ -101,10 +103,7 @@ static lv_obj_t* wakeup_label = NULL;
 
 static void app_wakeup_cause_ui_init(void);
 static void app_wakeup_cause_ui_set(app_wake_cause_t cause);
-static esp_err_t app_hdc2080_prepare_temp_threshold_wakeup(const hdc2080_t* s, float delta_c);
 static esp_err_t app_i2c_init_shared(void);
-static esp_err_t app_hdc2080_init(hdc2080_t* s);
-static bool app_hdc2080_irq_gpio_asserted(void);
 static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_ticks);
 static void app_configure_gpio_wakeup_sources(void);
 static void app_prepare_for_deep_sleep(void);
@@ -148,130 +147,6 @@ static void app_runtime_diag_task(void* arg);
 static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot);
 static void app_apply_rotation(lv_display_rotation_t rot);
 
-
-/* =========================================================
- * HDC2080 IRQ (runtime ISR -> task)
- * =========================================================
- * Keep this isolated from the CST816S touch IRQ path.
- * We do not perform I2C transactions in ISR context.
- */
-static TaskHandle_t hdc2080_irq_task_handle = NULL;
-static volatile bool hdc2080_irq_pending = false;
-
-static void IRAM_ATTR hdc2080_gpio_isr_handler(void* arg)
-{
-    (void)arg;
-    BaseType_t higher_woken = pdFALSE;
-    hdc2080_irq_pending = true;
-    if (hdc2080_irq_task_handle)
-    {
-        vTaskNotifyGiveFromISR(hdc2080_irq_task_handle, &higher_woken);
-    }
-    if (higher_woken)
-    {
-        portYIELD_FROM_ISR();
-    }
-}
-
-static esp_err_t app_hdc2080_irq_runtime_init(void)
-{
-
-
-    /* Configure the dedicated IRQ pin (HDC2080 INT is typically open-drain active-low). */
-    gpio_config_t irq_cfg = {
-        .pin_bit_mask = 1ULL << EXAMPLE_HDC2080_IRQ,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&irq_cfg));
-
-    ESP_LOGI(TAG, "[HDC2080] Init addr=0x%02X irq_gpio=%d", HDC2080_ADDR, (int)EXAMPLE_HDC2080_IRQ);
-
-    /* Only configure runtime edge-triggered ISR here.
-     * Deep-sleep wake configuration is handled separately.
-     */
-    ESP_RETURN_ON_ERROR(gpio_intr_disable(EXAMPLE_HDC2080_IRQ), TAG, "[HDC2080][IRQ] intr disable failed");
-
-    /* Install ISR service if not already installed by other code.
-     * Ignore 'already installed' error to stay compatible with touch demo code.
-     */
-    esp_err_t isr_err = gpio_install_isr_service(0);
-    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE)
-    {
-        return isr_err;
-    }
-
-    ESP_ERROR_CHECK(gpio_isr_handler_add(EXAMPLE_HDC2080_IRQ, hdc2080_gpio_isr_handler, NULL));
-
-    return ESP_OK;
-}
-
-static void app_hdc2080_irq_runtime_deinit(void)
-{
-    (void)gpio_intr_disable(EXAMPLE_HDC2080_IRQ);
-    (void)gpio_isr_handler_remove(EXAMPLE_HDC2080_IRQ);
-}
-
-
-/* =========================================================
- * HDC2080 IRQ task (runs in normal task context; safe for I2C)
- * ========================================================= */
-typedef enum
-{
-    SLEEP_STATE_SLEEPING = 0,
-    SLEEP_STATE_ACTIVE,
-} sleep_state_t;
-
-static volatile sleep_state_t sleep_state = SLEEP_STATE_SLEEPING;
-static volatile TickType_t active_until = 0;
-
-static void app_hdc2080_irq_task(void* arg)
-{
-    hdc2080_t* s = (hdc2080_t*)arg;
-    float temp_c = 0.0f;
-
-    while (1)
-    {
-        /* Coalesce multiple IRQ edges into one handling pass. */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        hdc2080_irq_pending = false;
-
-        if (!s || !hdc2080_is_connected(s))
-        {
-            continue;
-        }
-
-        /* Snapshot + clear interrupt status (device deasserts INT after this). */
-        uint8_t status = 0;
-        esp_err_t st_err = hdc2080_read_interrupt_status(s, &status);
-        if (st_err != ESP_OK)
-        {
-            ESP_LOGW(TAG, "[HDC2080][IRQ] Failed to read interrupt status: %s", esp_err_to_name(st_err));
-            continue;
-        }
-
-        /* Document threshold hits as simply as possible. */
-        if (status & 0x40) ESP_LOGW(TAG, "[HDC2080][IRQ] TEMP HIGH!");
-        if (status & 0x20) ESP_LOGW(TAG, "[HDC2080][IRQ] TEMP LOW!");
-
-        /* Fresh data ready. */
-        esp_err_t t_err = hdc2080_read_temp_c(s, &temp_c);
-        if (t_err == ESP_OK)
-        {
-            ESP_LOGI(TAG, "[HDC2080] Temp: %.2f C (status=0x%02X)", (double)temp_c, status);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "[HDC2080] Temp read failed after IRQ: %s", esp_err_to_name(t_err));
-        }
-
-        app_note_activity(APP_WAKE_TEMP_THRESHOLD, NULL);
-        active_until = xTaskGetTickCount() + pdMS_TO_TICKS(EXAMPLE_DISPLAY_ON_MS);
-        sleep_state = SLEEP_STATE_ACTIVE;
-    }
-}
 
 /* =========================================================
  * TOUCH ISR CALLBACK (CST816S README)
@@ -334,42 +209,42 @@ static void app_lvgl_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
  * ========================================================= */
 static esp_err_t app_lcd_init(void)
 {
-    ESP_LOGI(TAG, "[LCD] Init %dx%d ST7789", EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+    ESP_LOGI(TAG, "[LCD] Init %dx%d ST7789", LCD_H_RES, LCD_V_RES);
 
     /* Backlight GPIO */
     gpio_config_t bk_config = {
         .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << EXAMPLE_LCD_GPIO_BL
+        .pin_bit_mask = 1ULL << LCD_GPIO_BL
     };
     ESP_ERROR_CHECK(gpio_config(&bk_config));
-    gpio_set_level(EXAMPLE_LCD_GPIO_BL, !EXAMPLE_LCD_BL_ON_LEVEL);
+    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
 
     /* SPI bus */
     const spi_bus_config_t buscfg = {
-        .sclk_io_num = EXAMPLE_LCD_GPIO_SCLK,
-        .mosi_io_num = EXAMPLE_LCD_GPIO_MOSI,
+        .sclk_io_num = LCD_GPIO_SCLK,
+        .mosi_io_num = LCD_GPIO_MOSI,
         .miso_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT * 2,
+        .max_transfer_sz = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT * 2,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(EXAMPLE_LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
 
     /* Panel IO */
     const esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = EXAMPLE_LCD_GPIO_DC,
-        .cs_gpio_num = EXAMPLE_LCD_GPIO_CS,
-        .pclk_hz = EXAMPLE_LCD_PIXEL_CLK_HZ,
-        .lcd_cmd_bits = EXAMPLE_LCD_CMD_BITS,
-        .lcd_param_bits = EXAMPLE_LCD_PARAM_BITS,
+        .dc_gpio_num = LCD_GPIO_DC,
+        .cs_gpio_num = LCD_GPIO_CS,
+        .pclk_hz = LCD_PIXEL_CLK_HZ,
+        .lcd_cmd_bits = LCD_CMD_BITS,
+        .lcd_param_bits = LCD_PARAM_BITS,
         .spi_mode = 0,
         .trans_queue_depth = 10,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_LCD_SPI_NUM, &io_config, &lcd_io));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_NUM, &io_config, &lcd_io));
 
     /* ST7789 panel */
     const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = EXAMPLE_LCD_GPIO_RST,
+        .reset_gpio_num = LCD_GPIO_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = EXAMPLE_LCD_BITS_PER_PIXEL,
+        .bits_per_pixel = LCD_BITS_PER_PIXEL,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &lcd_panel));
 
@@ -379,7 +254,7 @@ static esp_err_t app_lcd_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel, true));
 
     /* Backlight ON */
-    gpio_set_level(EXAMPLE_LCD_GPIO_BL, EXAMPLE_LCD_BL_ON_LEVEL);
+    gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL);
 
     return ESP_OK;
 }
@@ -393,12 +268,24 @@ static esp_err_t app_touch_init(void)
 
     ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[I2C] init failed");
 
+    /* Ensure the touch INT line is correctly configured.
+     * CST816S INT is typically open-drain active-low, so enable a pull-up.
+     */
+    const gpio_config_t touch_int_cfg = {
+        .pin_bit_mask = 1ULL << TOUCH_GPIO_INT,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&touch_int_cfg));
+
     /* Touch config (RAW panel-native, LVGL rotates automatically) */
     const esp_lcd_touch_config_t tp_cfg = {
-        .x_max = EXAMPLE_LCD_H_RES,
-        .y_max = EXAMPLE_LCD_V_RES,
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
         .rst_gpio_num = GPIO_NUM_NC,
-        .int_gpio_num = EXAMPLE_TOUCH_GPIO_INT,
+        .int_gpio_num = TOUCH_GPIO_INT,
         .interrupt_callback = touch_isr_callback,
         .levels = {.reset = 0, .interrupt = 0},
         .flags = {.swap_xy = 0, .mirror_x = 0, .mirror_y = 0}, /* No manual rotation */
@@ -406,7 +293,7 @@ static esp_err_t app_touch_init(void)
 
     esp_lcd_panel_io_handle_t tp_io_handle;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
-    tp_io_config.scl_speed_hz = EXAMPLE_TOUCH_I2C_CLK_HZ;
+    tp_io_config.scl_speed_hz = TOUCH_I2C_CLK_HZ;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_handle, &tp_io_config, &tp_io_handle));
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &touch_handle));
 
@@ -438,10 +325,10 @@ static esp_err_t app_lvgl_init(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd_io,
         .panel_handle = lcd_panel,
-        .buffer_size = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT,
-        .double_buffer = EXAMPLE_LCD_DRAW_BUFF_DOUBLE,
-        .hres = EXAMPLE_LCD_H_RES,
-        .vres = EXAMPLE_LCD_V_RES,
+        .buffer_size = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT,
+        .double_buffer = LCD_DRAW_BUFF_DOUBLE,
+        .hres = LCD_H_RES,
+        .vres = LCD_V_RES,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .flags.buff_dma = true,
         .flags.swap_bytes = true,
@@ -481,12 +368,12 @@ static void app_display_turn_on(void)
     {
         (void)esp_lcd_panel_disp_on_off(lcd_panel, true);
     }
-    gpio_set_level(EXAMPLE_LCD_GPIO_BL, EXAMPLE_LCD_BL_ON_LEVEL);
+    gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL);
 }
 
 static void app_display_turn_off(void)
 {
-    gpio_set_level(EXAMPLE_LCD_GPIO_BL, !EXAMPLE_LCD_BL_ON_LEVEL);
+    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
     if (lcd_panel)
     {
         (void)esp_lcd_panel_disp_on_off(lcd_panel, false);
@@ -579,6 +466,18 @@ static void app_wakeup_cause_ui_set(app_wake_cause_t cause)
 
 static void app_configure_gpio_wakeup_sources(void)
 {
+    /* Configure only the HDC2080 IRQ pin here to keep init simple.
+     * HDC2080 INT is typically open-drain active-low, so ensure a pull-up.
+     */
+    const gpio_config_t hdc_irq_cfg = {
+        .pin_bit_mask = 1ULL << HDC2080_IRQ,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&hdc_irq_cfg));
+
     /* IMPORTANT:
      * gpio_wakeup_enable() touches GPIO interrupt configuration.
      * If an IRQ line is already active (e.g. touch INT stuck low), doing this while
@@ -587,18 +486,18 @@ static void app_configure_gpio_wakeup_sources(void)
      * So we only call this as part of the deep-sleep transition, after disabling
      * runtime touch IRQ handling.
      */
-    ESP_ERROR_CHECK(gpio_wakeup_enable(EXAMPLE_TOUCH_GPIO_INT, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK(gpio_wakeup_enable(EXAMPLE_HDC2080_IRQ, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(gpio_wakeup_enable(TOUCH_GPIO_INT, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(gpio_wakeup_enable(HDC2080_IRQ, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
 
     ESP_LOGI(TAG, "[SLEEP] GPIO wake armed: touch=%d, hdc2080=%d (low-level)",
-             (int)EXAMPLE_TOUCH_GPIO_INT, (int)EXAMPLE_HDC2080_IRQ);
+             (int)TOUCH_GPIO_INT, (int)HDC2080_IRQ);
 }
 
 static void app_prepare_for_deep_sleep(void)
 {
     /* Stop runtime IRQ-driven touch reads before reconfiguring GPIOs for wake. */
-    (void)gpio_intr_disable(EXAMPLE_TOUCH_GPIO_INT);
+    (void)gpio_intr_disable(TOUCH_GPIO_INT);
 
     if (touch_irq_sem)
     {
@@ -616,109 +515,21 @@ static esp_err_t app_i2c_init_shared(void)
     }
 
     const i2c_master_bus_config_t i2c_config = {
-        .i2c_port = EXAMPLE_TOUCH_I2C_NUM,
-        .sda_io_num = EXAMPLE_TOUCH_I2C_SDA,
-        .scl_io_num = EXAMPLE_TOUCH_I2C_SCL,
+        .i2c_port = TOUCH_I2C_NUM,
+        .sda_io_num = TOUCH_I2C_SDA,
+        .scl_io_num = TOUCH_I2C_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .flags.enable_internal_pullup = true,
     };
 
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_config, &i2c_bus_handle), TAG, "[I2C] new bus failed");
     ESP_LOGI(TAG, "[I2C] Master bus ready on I2C%d (SDA=%d SCL=%d)",
-             EXAMPLE_TOUCH_I2C_NUM, (int)EXAMPLE_TOUCH_I2C_SDA, (int)EXAMPLE_TOUCH_I2C_SCL);
-    return ESP_OK;
-}
-
-static esp_err_t app_hdc2080_init(hdc2080_t* s)
-{
-    if (!s) return ESP_ERR_INVALID_ARG;
-
-    ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[I2C] init failed");
-
-
-    ESP_LOGI(TAG, "[HDC2080] Initializing...");
-    ESP_RETURN_ON_ERROR(hdc2080_init(s, i2c_bus_handle, HDC2080_ADDR, 100000), TAG, "HDC init failed");
-    vTaskDelay(pdMS_TO_TICKS(50)); // Stabilize
-    if (!hdc2080_is_connected(s))
-    {
-        ESP_LOGW(TAG, "[HDC2080] Sensor not found at addr=0x%02X", HDC2080_ADDR);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // 1. HARD RESET (clears everything)
-    ESP_RETURN_ON_ERROR(hdc2080_reset(s), TAG, "Reset failed");
-    vTaskDelay(pdMS_TO_TICKS(50)); // Stabilize
-
-    // 2. MEASUREMENT CONFIG (0x0F): 14-bit Temp-only
-    uint8_t meas = 0x00; // TRES14=00 HRES14=00 MEAS_TEMP=10
-    ESP_RETURN_ON_ERROR(hdc2080_write_reg(s, 0x0F, meas), TAG, "Meas config failed");
-
-    // 3. THRESHOLD ENABLE (0x07): TH+TL only (0x60)
-    uint8_t int_en = 0x60; // TH_EN=1 TL_EN=1 HH/HL=0
-    ESP_RETURN_ON_ERROR(hdc2080_write_reg(s, 0x07, int_en), TAG, "Int enable failed");
-
-    // 4. MAIN CONFIG (0x0E): 1Hz AMM + Comparator + Active Low + IRQ enabled
-    uint8_t config = 0x55; // RST=0 AMM1Hz=101 HEAT=0 IRQ_EN=1 POL=0 MODE=1
-    ESP_RETURN_ON_ERROR(hdc2080_write_reg(s, 0x0E, config), TAG, "Config failed");
-
-    // 5. KICKSTART AUTO MEASUREMENT (triggers first conversion)
-    meas |= 0x01; // MEAS_TRIG=1
-    ESP_RETURN_ON_ERROR(hdc2080_write_reg(s, 0x0F, meas), TAG, "Kickstart failed");
-    vTaskDelay(pdMS_TO_TICKS(10)); // ~6ms conversion
-
-    // 6. Verify
-    uint8_t status;
-    hdc2080_read_interrupt_status(s, &status);
-    ESP_LOGI(TAG, "[HDC2080] Init complete: status=0x%02X", status);
-
-    // 7. ARM first thresholds (±2°C example)
-    ESP_RETURN_ON_ERROR(app_hdc2080_prepare_temp_threshold_wakeup(s, 0.2f), TAG, "Prepare thr wake failed");
-
-    return ESP_OK;
-}
-
-static esp_err_t app_hdc2080_prepare_temp_threshold_wakeup(const hdc2080_t *s, float delta_c)
-{
-    if (!s) return ESP_ERR_INVALID_ARG;
-    if (!hdc2080_is_connected(s)) return ESP_ERR_NOT_FOUND;
-
-    float t = 0.0f;
-
-    // 1. Fresh baseline temp (AMM already running)
-    ESP_RETURN_ON_ERROR(hdc2080_read_temp_c(s, &t), TAG, "HDC read temp failed");
-
-    // 2. Clear stale status (unlatches IRQ)
-    uint8_t status;
-    ESP_RETURN_ON_ERROR(hdc2080_read_interrupt_status(s, &status), TAG, "Clear status failed");
-    ESP_LOGD(TAG, "[HDC2080] Cleared status=0x%02X", status);
-
-    // 3. Arm thresholds around baseline
-    const float low  = t - delta_c;
-    const float high = t + delta_c;
-    ESP_RETURN_ON_ERROR(hdc2080_set_low_temp(s, low), TAG, "Set low thr failed");
-    ESP_RETURN_ON_ERROR(hdc2080_set_high_temp(s, high), TAG, "Set high thr failed");
-
-    // 4. Enable TH+TL only (0x07 = 0x60)
-    ESP_RETURN_ON_ERROR(hdc2080_enable_threshold_interrupt(s, HDC2080_TEMP_ONLY),
-                        TAG, "Enable TH/TL failed");
-
-    // 5. Static config (set once at boot, not every re-arm)
-    //    - Comparator + 1Hz AMM + Active Low + DRDY_INT_EN
-    //    - Move these to init() if not already
-
-    ESP_LOGI(TAG, "[HDC2080] Armed: %.2f°C ±%.2f°C (low=%.2f high=%.2f)",
-             (double)t, (double)delta_c, (double)low, (double)high);
-
+             TOUCH_I2C_NUM, (int)TOUCH_I2C_SDA, (int)TOUCH_I2C_SCL);
     return ESP_OK;
 }
 
 
-static bool app_hdc2080_irq_gpio_asserted(void)
-{
-    /* HDC2080 INT is typically active-low. */
-    int lvl = gpio_get_level(EXAMPLE_HDC2080_IRQ);
-    return (lvl == 0);
-}
+
 
 
 static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_ticks)
@@ -733,11 +544,11 @@ static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_
 
     if (cause == APP_WAKE_TOUCH)
     {
-        ESP_LOGI(TAG, "[UI] Touch activity -> display on for %d ms", EXAMPLE_DISPLAY_ON_MS);
+        ESP_LOGI(TAG, "[UI] Touch activity -> display on for %d ms", DISPLAY_ON_MS);
     }
     else if (cause == APP_WAKE_TEMP_THRESHOLD)
     {
-        ESP_LOGI(TAG, "[UI] Temp threshold activity -> display on for %d ms", EXAMPLE_DISPLAY_ON_MS);
+        ESP_LOGI(TAG, "[UI] Temp threshold activity -> display on for %d ms", DISPLAY_ON_MS);
     }
 }
 
@@ -791,138 +602,79 @@ static void app_main_display(void)
 }
 
 
-// HDC 2080 TEMP SENSOR
-// #define HDC2080_ADDR 0x40
-
-static hdc2080_t hdc;
-
-/* =========================================================
- * MAIN
- * ========================================================= */
-void app_main(void)
-{
-    esp_log_level_set(TAG, ESP_LOG_INFO);
-    ESP_LOGI(TAG, "[APP] Starting...");
-
-    //#define TOUCH_DISPLAY_DEMO
-#ifdef TOUCH_DISPLAY_DEMO
-    ESP_LOGI(TAG, "[APP] Touch display demo");
-    touch_irq_sem = xSemaphoreCreateBinary();
-    if (!touch_irq_sem)
-    {
-        ESP_LOGE(TAG, "Failed to create touch semaphore");
-        return;
-    }
-
-    if (app_lcd_init() != ESP_OK) return;
-    if (app_touch_init() != ESP_OK) return;
-    if (app_lvgl_init() != ESP_OK) return;
-
-    xTaskCreate(app_runtime_diag_task, "diag", 3072, NULL, 1, NULL);
-    app_main_display();
-#else
-    /* Temperature + humidity demo */
-    ESP_LOGI(TAG, "[APP] HD2080 demo");
-    touch_irq_sem = xSemaphoreCreateBinary();
-    if (!touch_irq_sem)
-    {
-        ESP_LOGE(TAG, "Failed to create touch semaphore");
-        return;
-    }
-
-    if (app_lcd_init() != ESP_OK) return;
-    if (app_touch_init() != ESP_OK) return;
-    if (app_lvgl_init() != ESP_OK) return;
-
-    /* Create the temp/humidity UI */
-    app_temp_display_ui_init();
-    app_wakeup_cause_ui_init();
-
-    /* HDC2080 init kept separate from touch init (shared I2C bus under the hood) */
-    const bool sensor_connected = (app_hdc2080_init(&hdc) == ESP_OK);
-    if (!sensor_connected)
-    {
-        ESP_LOGW(TAG, "[HDC2080] Not detected at 0x%02X", HDC2080_ADDR);
-    }
-    uint8_t st = 0;
-    esp_err_t err = hdc2080_read_interrupt_status(&hdc, &st);
-    if (err == ESP_OK)
-    {
-        ESP_LOGI(TAG, "[HDC2080] Interrupt status reg: 0x%02X", st);
-    }
-
-    /* After boot/wake, arm the temperature threshold interrupt around current temperature */
-     esp_err_t thr_err = app_hdc2080_prepare_temp_threshold_wakeup(&hdc, EXAMPLE_TEMP_DELTA_WAKE_C);
-     if (thr_err != ESP_OK)
-     {
-         ESP_LOGW(TAG, "[HDC2080] Threshold wake prep failed: %s", esp_err_to_name(thr_err));
-     }
-
-    /* Start runtime IRQ handling (edge-triggered ISR -> task).
-     * This is separate from deep-sleep GPIO wake config.
-     */
-
-    xTaskCreate(app_hdc2080_irq_task, "hdc_irq", 4096, &hdc, 5, &hdc2080_irq_task_handle);
-
-    esp_err_t irq_init_err = app_hdc2080_irq_runtime_init();
-    if (irq_init_err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "[HDC2080][IRQ] Runtime IRQ init failed: %s", esp_err_to_name(irq_init_err));
-    }
-
-    // Enable last
-    gpio_intr_enable(EXAMPLE_HDC2080_IRQ);
-
-    /* Start with display off until first activity */
-    app_display_turn_off();
-    ESP_LOGI(TAG, "[UI] Display off until activity");
-
-    //------------------------- MAIN LOOP -------------------------
-
-    while (1)
-    {
-        const TickType_t now = xTaskGetTickCount();
-
-        // =========================================================
-        // SLEEP: display off; wait for HDC2080 threshold IRQ edge
-        // =========================================================
-        if (sleep_state == SLEEP_STATE_SLEEPING)
-        {
-             vTaskDelay(pdMS_TO_TICKS(20));
-             continue;
-        }
-
-        // =========================================================
-        // ACTIVE: keep display on for 3 seconds, then re-arm + sleep
-        // =========================================================
-        if (sleep_state == SLEEP_STATE_ACTIVE)
-        {
-            if (now >= active_until)
-            {
-                /* Re-arm threshold ONCE when leaving ACTIVE back to SLEEP. */
-                if (sensor_connected)
-                {
-                    (void)app_hdc2080_prepare_temp_threshold_wakeup(&hdc, EXAMPLE_TEMP_DELTA_WAKE_C);
-                }
-
-                app_display_turn_off();
-                sleep_state = SLEEP_STATE_SLEEPING;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        /* Should never happen, but keeps us robust if state gets corrupted. */
-        sleep_state = SLEEP_STATE_SLEEPING;
-    }
-#endif
-}
-
-
 /* =========================================================
  * RUNTIME DIAGNOSTICS
  * ========================================================= */
+/* Optional: call this right before deep sleep to log the levels you are about to arm with */
+static void app_sleep_debug_dump_pins(void)
+{
+    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
+    const int hdc_lvl   = gpio_get_level(HDC2080_IRQ);
+    ESP_LOGI(TAG, "[SLEEP] pre-sleep pin levels: touch GPIO%d=%d, hdc GPIO%d=%d",
+             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl);
+}
+
+static void app_wake_debug_dump_ext1(void)
+{
+    const esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "[WAKE] cause=%d", (int)wc);
+
+    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
+    const int hdc_lvl   = gpio_get_level(HDC2080_IRQ);
+    ESP_LOGI(TAG, "[WAKE] boot pin levels: touch GPIO%d=%d, hdc GPIO%d=%d",
+             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl);
+
+    if (wc == ESP_SLEEP_WAKEUP_EXT1) {
+        const uint64_t m = esp_sleep_get_ext1_wakeup_status();
+        ESP_LOGI(TAG, "[WAKE] ext1 wake mask=0x%016" PRIx64, m);
+
+        const bool touch_hit = (m & (1ULL << (int)TOUCH_GPIO_INT)) != 0;
+        const bool hdc_hit   = (m & (1ULL << (int)HDC2080_IRQ)) != 0;
+        ESP_LOGI(TAG, "[WAKE] ext1 bits: touch=%d, hdc=%d", (int)touch_hit, (int)hdc_hit);
+    }
+}
+
+static void app_configure_wakeup_sources_ext1_lowlevel(void)
+{
+    /* Deep sleep GPIO wake on ESP32-S3 must use EXT0/EXT1 (ESP_SLEEP_WAKEUP_GPIO is light sleep only).
+     * Both CST816S INT and HDC2080 INT are active-low (open-drain) => use pull-ups and ANY_LOW.
+     */
+
+    /* Make sure both wake pins are inputs with pull-ups right before arming EXT1.
+     * (We do this here so it also applies after wake, regardless of earlier init order.)
+     */
+    const gpio_config_t wake_gpio_cfg = {
+        .pin_bit_mask = (1ULL << (int)HDC2080_IRQ) | (1ULL << (int)TOUCH_GPIO_INT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&wake_gpio_cfg));
+
+    /* If touch INT is already asserted (low) right now, arming it as an ANY_LOW wake source
+     * will either cause an immediate wake-loop or make it look like touch never wakes.
+     * In that case, fall back to only HDC2080 for this sleep cycle.
+     */
+    uint64_t mask = (1ULL << (int)HDC2080_IRQ) | (1ULL << (int)TOUCH_GPIO_INT);
+    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
+    if (touch_lvl == 0) {
+        ESP_LOGW(TAG, "[SLEEP] Touch INT already LOW before sleep; excluding touch from EXT1 mask for this cycle");
+        mask &= ~(1ULL << (int)TOUCH_GPIO_INT);
+    }
+
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+#else
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+#endif
+
+    ESP_LOGI(TAG, "[SLEEP] EXT1 wake armed mask=0x%016" PRIx64 " ANY_LOW", mask);
+}
+
+
 static void app_runtime_diag_task(void* arg)
 {
     (void)arg;
@@ -940,11 +692,11 @@ static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot)
 
     /* Gap is a panel RAM-window quirk; we tie it to portrait vs landscape orientation. */
     if (rot == LV_DISPLAY_ROTATION_90 || rot == LV_DISPLAY_ROTATION_270) {
-        x_off = EXAMPLE_LCD_LANDSCAPE_X_OFFSET;
-        y_off = EXAMPLE_LCD_LANDSCAPE_Y_OFFSET;
+        x_off = LCD_LANDSCAPE_X_OFFSET;
+        y_off = LCD_LANDSCAPE_Y_OFFSET;
     } else {
-        x_off = EXAMPLE_LCD_PORTRAIT_X_OFFSET;
-        y_off = EXAMPLE_LCD_PORTRAIT_Y_OFFSET;
+        x_off = LCD_PORTRAIT_X_OFFSET;
+        y_off = LCD_PORTRAIT_Y_OFFSET;
     }
 
     ESP_LOGI(TAG, "[LCD] set_gap for rotation=%d -> x=%d y=%d", (int)rot, x_off, y_off);
@@ -1017,6 +769,187 @@ static void app_touch_dot_update(int32_t x, int32_t y, bool pressed)
 
     lvgl_port_unlock();
 }
+
+// HDC 2080 TEMP SENSOR
+// #define HDC2080_ADDR 0x40
+
+
+/* =========================================================
+ * MAIN
+ * ========================================================= */
+void app_main(void)
+{
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    ESP_LOGI(TAG, "[APP] Starting...");
+
+    //#define TOUCH_DISPLAY_DEMO
+#ifdef TOUCH_DISPLAY_DEMO
+    ESP_LOGI(TAG, "[APP] Touch display demo");
+    touch_irq_sem = xSemaphoreCreateBinary();
+    if (!touch_irq_sem)
+    {
+        ESP_LOGE(TAG, "Failed to create touch semaphore");
+        return;
+    }
+
+    if (app_lcd_init() != ESP_OK) return;
+    if (app_touch_init() != ESP_OK) return;
+    if (app_lvgl_init() != ESP_OK) return;
+
+    xTaskCreate(app_runtime_diag_task, "diag", 3072, NULL, 1, NULL);
+    app_main_display();
+#else
+    /* Temperature + humidity demo */
+    ESP_LOGI(TAG, "[APP] HD2080 demo");
+    touch_irq_sem = xSemaphoreCreateBinary();
+    if (!touch_irq_sem)
+    {
+        ESP_LOGE(TAG, "Failed to create touch semaphore");
+        return;
+    }
+
+    if (app_lcd_init() != ESP_OK) return;
+    if (app_touch_init() != ESP_OK) return;
+    if (app_lvgl_init() != ESP_OK) return;
+
+    /* Create the temp/humidity UI */
+    app_temp_display_ui_init();
+    app_wakeup_cause_ui_init();
+    ESP_LOGI(TAG, "=== HDC2080 TH/TL IRQ example (ESP-IDF v5.5 component) ===");
+
+    app_wake_debug_dump_ext1();
+
+    /* Determine wakeup cause (best-effort) */
+    app_wake_cause_t wake_ui = APP_WAKE_UNKNOWN;
+    const esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+    if (wc == ESP_SLEEP_WAKEUP_EXT1)
+    {
+        const uint64_t m = esp_sleep_get_ext1_wakeup_status();
+        if (m & (1ULL << (int)TOUCH_GPIO_INT)) {
+            wake_ui = APP_WAKE_TOUCH;
+        } else if (m & (1ULL << (int)HDC2080_IRQ)) {
+            wake_ui = APP_WAKE_TEMP_THRESHOLD;
+        } else {
+            wake_ui = APP_WAKE_UNKNOWN;
+        }
+    } else {
+        ESP_LOGI(TAG, "Not woke by EXT1 (cause=%d)", (int)wc);
+    }
+
+    // print wakeup in clear text
+    ESP_LOGI(TAG, "Wakeup cause: %s",
+             (wake_ui == APP_WAKE_TOUCH) ? "Touch" :
+             (wake_ui == APP_WAKE_TEMP_THRESHOLD) ? "Temp threshold" :
+             "Unknown");
+
+    app_wakeup_cause_ui_set(wake_ui);
+
+    /* Use the shared I2C master bus (already used by touch) */
+    ESP_ERROR_CHECK(app_i2c_init_shared());
+
+    //-----------------------------------------------------
+    // init HDC 2080
+    //-----------------------------------------------------
+
+    hdc2080_handle_t h = NULL;
+    hdc2080_config_t cfg = {
+        .i2c_bus = i2c_bus_handle,
+        .i2c_addr = 0x40,
+        .i2c_timeout_ms = 1000,
+
+        .int_gpio = HDC2080_IRQ,
+        .int_polarity = HDC2080_INT_ACTIVE_LOW,  // same as ACTIVE_LOW=true
+        .int_pull = HDC2080_INT_PULLUP,          // same as USE_INTERNAL_PULL=true + ACTIVE_LOW
+
+        .amm_rate = HDC2080_AMM_1HZ,
+        .meas_wait_ms = 30,
+        .deassert_wait_ms = 200,
+
+        .debounce_ms = 30,
+    };
+
+    ESP_ERROR_CHECK(hdc2080_init(&cfg, &h));
+
+    // Optional: dump configuration for verification
+    ESP_ERROR_CHECK(hdc2080_dump_config(h));
+
+    // Clear any stale status after reset/wake
+    hdc2080_status_t st0 = {0};
+    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st0));
+    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) after wake/init: 0x%02X (TH=%d TL=%d)",
+             st0.raw, (int)st0.th, (int)st0.tl);
+
+    // 2) Baseline measure
+    hdc2080_measurement_t m = {0};
+    ESP_ERROR_CHECK(hdc2080_measure_temp_humidity(h, true /*temp_only*/, &m));
+    ESP_LOGI(TAG, "Baseline temp: %.2f C", (double)m.temp_c);
+
+    // Update UI once before sleep (humidity not measured in temp_only mode)
+    app_temp_display_update(m.temp_c, 0.0f, true);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // 3) Decide and arm. Example chooses rising threshold (TH): baseline + delta
+    const bool want_rising = true;
+
+
+    if (want_rising) {
+        ESP_ERROR_CHECK(hdc2080_arm_irq(h, HDC2080_IRQ_TH, m.temp_c, TEMP_DELTA_WAKE_C));
+        ESP_LOGI(TAG,"RAISING - Baseline: %.2f C, new target temp %.2f",
+         (double)m.temp_c,
+         (double)(m.temp_c + TEMP_DELTA_WAKE_C));
+
+    } else {
+        ESP_LOGI(TAG,"FALLING - Baseline: %.2f C, new target temp %.2f",
+                 (double)m.temp_c,
+                 (double)(m.temp_c - TEMP_DELTA_WAKE_C));
+
+        ESP_ERROR_CHECK(hdc2080_arm_irq(h, HDC2080_IRQ_TL, m.temp_c, TEMP_DELTA_WAKE_C));
+    }
+
+    // Clear again so we don't immediately wake from a latched flag
+    hdc2080_status_t st1 = {0};
+    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st1));
+    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) after arming: 0x%02X (TH=%d TL=%d)",
+             st1.raw, (int)st1.th, (int)st1.tl);
+
+    // Confirm INT pin is inactive before enabling GPIO wake + deep sleep.
+    // For ACTIVE_LOW, inactive means GPIO reads HIGH.
+    if (hdc2080_int_is_asserted(h)) {
+        ESP_LOGW(TAG, "HDC2080 INT is still asserted before sleep (GPIO%d level=%d). "
+                     "Either still above TH, status not cleared, or polarity/wiring issue.",
+                     (int)HDC2080_IRQ, gpio_get_level(HDC2080_IRQ));
+    } else {
+        ESP_LOGI(TAG, "HDC2080 INT inactive before sleep (GPIO%d level=%d)",
+                 (int)HDC2080_IRQ, gpio_get_level(HDC2080_IRQ));
+    }
+
+    // One more read-to-clear right before sleeping to avoid getting stuck asserted.
+    hdc2080_status_t st2 = {0};
+    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st2));
+    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) before deep sleep: 0x%02X (TH=%d TL=%d)",
+             st2.raw, (int)st2.th, (int)st2.tl);
+
+    // 4) Configure deep sleep wakeup on INT pin(s).
+    // Use EXT1 wake for deep sleep on ESP32-S3.
+    app_configure_wakeup_sources_ext1_lowlevel();
+    app_sleep_debug_dump_pins();
+
+    ESP_LOGI(TAG, "Entering deep sleep; wake on GPIO: touch GPIO%d low, hdc2080 GPIO%d low",
+             (int)TOUCH_GPIO_INT, (int)HDC2080_IRQ);
+
+    app_display_turn_off();
+    vTaskDelay(pdMS_TO_TICKS(20)); // let the SPI transaction / GPIO settle
+
+    // Give logs time to flush
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    esp_deep_sleep_start();
+
+    // On wake, execution restarts from app_main().
+    // Typical pattern: check wake cause, read/clear status, measure, re-arm, sleep again.
+#endif
+}
+
 
 /* =========================================================
  * HDC2080 TEMP SENSOR
