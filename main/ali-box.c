@@ -25,6 +25,8 @@
 #include "esp_lvgl_port.h"
 #include "esp_sleep.h"
 
+#include "qmi8658.h"
+
 #include "hdc2080.h"
 
 #include <stdio.h>  /* snprintf */
@@ -86,6 +88,17 @@ static const char* TAG = "MAIN";
 #define TEMP_DELTA_WAKE_C    (2.f)
 #define DISPLAY_ON_MS        (3000)
 
+/* === IMU (QMI8658) interrupt pins ===
+ * IMU INT1 = GPIO8, INT2 = GPIO7 (per user wiring).
+ * Assumption for EXT1: interrupt is active-low (common open-drain).
+ * If your wiring/config is active-high, switch EXT1 mode to ANY_HIGH.
+ */
+#define IMU_INT1_GPIO        (GPIO_NUM_8)
+#define IMU_INT2_GPIO        (GPIO_NUM_7)
+
+/* Wake-on-motion sensitivity (library uses register 0x0B). Tune as needed. */
+#define QMI8658_WOM_THRESHOLD_DEFAULT (20)
+
 /* Wake sources
  * Touch IRQ is on GPIO21 (TOUCH_GPIO_INT).
  * HDC2080 IRQ is on GPIO15 (HDC2080_IRQ).
@@ -135,6 +148,14 @@ static lv_indev_t* lvgl_touch_indev = NULL;
 /* Shared I2C bus (created once; reused by touch + sensors) */
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 
+/* Optional IMU (QMI8658) power handling
+ * We do NOT probe the IMU during sleep entry because an unexpected NACK
+ * can break the I2C driver state and spam logs right before deep sleep.
+ * If you actually initialize/use QMI8658 in this firmware, set these from that init.
+ */
+static bool s_qmi8658_inited = false;
+static qmi8658_dev_t s_qmi8658 = {0};
+
 /* IRQ semaphore for CST816S (per component README) */
 static SemaphoreHandle_t touch_irq_sem = NULL;
 
@@ -146,6 +167,7 @@ static void app_main_display(void);
 static void app_runtime_diag_task(void* arg);
 static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot);
 static void app_apply_rotation(lv_display_rotation_t rot);
+static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool keep_hdc_wake);
 
 
 /* =========================================================
@@ -209,6 +231,10 @@ static void app_lvgl_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
  * ========================================================= */
 static esp_err_t app_lcd_init(void)
 {
+
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis(LCD_GPIO_BL);
+
     ESP_LOGI(TAG, "[LCD] Init %dx%d ST7789", LCD_H_RES, LCD_V_RES);
 
     /* Backlight GPIO */
@@ -364,19 +390,36 @@ static esp_err_t app_lvgl_init(void)
  * ========================================================= */
 static void app_display_turn_on(void)
 {
+    // Wake the panel first (exit sleep), then turn the display on, then enable backlight
     if (lcd_panel)
     {
+        gpio_deep_sleep_hold_dis();
+        gpio_hold_dis(LCD_GPIO_BL);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // Best-effort: some panels require a delay after SLPOUT
+        (void)esp_lcd_panel_disp_sleep(lcd_panel, false);
+        vTaskDelay(pdMS_TO_TICKS(120));
         (void)esp_lcd_panel_disp_on_off(lcd_panel, true);
     }
+
     gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL);
 }
 
 static void app_display_turn_off(void)
 {
+    // 1) Kill backlight first (this is usually the visible "light" you still see)
     gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
+
+    // 2) Then tell the controller to turn the display off and enter sleep mode
     if (lcd_panel)
     {
         (void)esp_lcd_panel_disp_on_off(lcd_panel, false);
+        (void)esp_lcd_panel_disp_sleep(lcd_panel, true);
+        // ST7789 datasheet: allow time to enter sleep (tSLPIN). 120ms is a safe value.
+        vTaskDelay(pdMS_TO_TICKS(120));
+
+
     }
 }
 
@@ -528,9 +571,42 @@ static esp_err_t app_i2c_init_shared(void)
     return ESP_OK;
 }
 
+static esp_err_t app_qmi8658_init_optional(void)
+{
+    if (s_qmi8658_inited) {
+        return ESP_OK;
+    }
 
+    /* Reuse the existing shared I2C bus (same as touch + HDC2080). */
+    ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[IMU] I2C init failed");
 
+    /* Configure IMU interrupt pins as inputs with pull-ups.
+     * This is safe even if the IMU isn't actually present.
+     */
+    const gpio_config_t imu_int_cfg = {
+        .pin_bit_mask = (1ULL << (int)IMU_INT1_GPIO) | (1ULL << (int)IMU_INT2_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&imu_int_cfg));
 
+    /* Try both common I2C addresses (0x6B then 0x6A). */
+    esp_err_t ret = qmi8658_init(&s_qmi8658, i2c_bus_handle, QMI8658_ADDRESS_HIGH);
+    if (ret != ESP_OK) {
+        ret = qmi8658_init(&s_qmi8658, i2c_bus_handle, QMI8658_ADDRESS_LOW);
+    }
+
+    if (ret == ESP_OK) {
+        s_qmi8658_inited = true;
+        ESP_LOGI(TAG, "[IMU] QMI8658 initialized (INT1=GPIO%d INT2=GPIO%d)", (int)IMU_INT1_GPIO, (int)IMU_INT2_GPIO);
+    } else {
+        ESP_LOGW(TAG, "[IMU] QMI8658 not detected/init failed: %s (IMU wake disabled)", esp_err_to_name(ret));
+    }
+
+    return ret;
+}
 
 static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_ticks)
 {
@@ -621,8 +697,11 @@ static void app_wake_debug_dump_ext1(void)
 
     const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
     const int hdc_lvl   = gpio_get_level(HDC2080_IRQ);
-    ESP_LOGI(TAG, "[WAKE] boot pin levels: touch GPIO%d=%d, hdc GPIO%d=%d",
-             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl);
+    const int imu1_lvl  = gpio_get_level(IMU_INT1_GPIO);
+    const int imu2_lvl  = gpio_get_level(IMU_INT2_GPIO);
+    ESP_LOGI(TAG, "[WAKE] boot pin levels: touch GPIO%d=%d, hdc GPIO%d=%d, imu1 GPIO%d=%d, imu2 GPIO%d=%d",
+             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl,
+             (int)IMU_INT1_GPIO, imu1_lvl, (int)IMU_INT2_GPIO, imu2_lvl);
 
     if (wc == ESP_SLEEP_WAKEUP_EXT1) {
         const uint64_t m = esp_sleep_get_ext1_wakeup_status();
@@ -630,7 +709,10 @@ static void app_wake_debug_dump_ext1(void)
 
         const bool touch_hit = (m & (1ULL << (int)TOUCH_GPIO_INT)) != 0;
         const bool hdc_hit   = (m & (1ULL << (int)HDC2080_IRQ)) != 0;
-        ESP_LOGI(TAG, "[WAKE] ext1 bits: touch=%d, hdc=%d", (int)touch_hit, (int)hdc_hit);
+        const bool imu1_hit  = (m & (1ULL << (int)IMU_INT1_GPIO)) != 0;
+        const bool imu2_hit  = (m & (1ULL << (int)IMU_INT2_GPIO)) != 0;
+        ESP_LOGI(TAG, "[WAKE] ext1 bits: touch=%d, hdc=%d, imu1=%d, imu2=%d",
+                 (int)touch_hit, (int)hdc_hit, (int)imu1_hit, (int)imu2_hit);
     }
 }
 
@@ -847,6 +929,11 @@ void app_main(void)
     /* Use the shared I2C master bus (already used by touch) */
     ESP_ERROR_CHECK(app_i2c_init_shared());
 
+    /* Optional: init IMU so it can be used as an additional deep-sleep wake source.
+     * If the IMU isn't present, we just log a warning and continue.
+     */
+//    (void)app_qmi8658_init_optional();
+
     //-----------------------------------------------------
     // init HDC 2080
     //-----------------------------------------------------
@@ -931,19 +1018,10 @@ void app_main(void)
 
     // 4) Configure deep sleep wakeup on INT pin(s).
     // Use EXT1 wake for deep sleep on ESP32-S3.
-    app_configure_wakeup_sources_ext1_lowlevel();
     app_sleep_debug_dump_pins();
 
-    ESP_LOGI(TAG, "Entering deep sleep; wake on GPIO: touch GPIO%d low, hdc2080 GPIO%d low",
-             (int)TOUCH_GPIO_INT, (int)HDC2080_IRQ);
-
-    app_display_turn_off();
-    vTaskDelay(pdMS_TO_TICKS(20)); // let the SPI transaction / GPIO settle
-
-    // Give logs time to flush
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    esp_deep_sleep_start();
+    ESP_LOGI(TAG, "Entering deep sleep via unified power-save routine");
+    app_power_save_shutdown_and_sleep_ext1(true /*touch*/, true /*hdc2080*/);
 
     // On wake, execution restarts from app_main().
     // Typical pattern: check wake cause, read/clear status, measure, re-arm, sleep again.
@@ -955,3 +1033,151 @@ void app_main(void)
  * HDC2080 TEMP SENSOR
  * ========================================================= */
 
+/* =========================================================
+ * POWER SAVING (ALL-IN-ONE) – keep at end of file
+ *
+ * Goal:
+ *  - Minimize board leakage before deep sleep
+ *  - Preserve wake from CST816S INT (GPIO21) and HDC2080 INT (GPIO15)
+ *  - Avoid ISR contention / wake loops if a wake pin is already asserted
+ *
+ * Notes:
+ *  - Board-level 3V3 peripherals (buck IQ, LCD VDD rail, sensors) can dominate current.
+ *  - We can still reduce current by putting peripherals into sleep/suspend and
+ *    ensuring GPIOs aren’t sourcing/sinking current.
+ *
+ * This is a single function on purpose (per request).
+ * ========================================================= */
+static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool keep_hdc_wake)
+{
+    /* --- 0) Quiesce runtime IRQ-driven touch reads (prevents WDT issues) --- */
+    (void)gpio_intr_disable(TOUCH_GPIO_INT);
+    if (touch_irq_sem) {
+        (void)xSemaphoreTake(touch_irq_sem, 0);
+    }
+
+    /* Give pending log output / I2C work a moment to finish before we touch the bus. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* --- 1) Put peripherals into lower power (best effort) --- */
+    if (i2c_bus_handle) {
+        /* Touch controller: enter deep sleep / low power mode.
+         * The INT pin stays wired to the ESP32 for wake (EXT1 ANY_LOW).
+         */
+        if (touch_handle) {
+            esp_err_t tr = esp_lcd_touch_cst816s_enter_sleep(touch_handle);
+            if (tr != ESP_OK) {
+                ESP_LOGW(TAG, "[SLEEP] CST816S enter sleep failed: %s", esp_err_to_name(tr));
+            }
+            /* Give the controller time to settle into sleep mode before MCU sleep */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        /* QMI8658:
+         * Keep it running in accel low-power + wake-on-motion so its INT can wake the ESP32.
+         * NOTE: This only works if the IMU interrupt pin is actually configured in HW and
+         * routed to INT1/INT2, and the INT line is not floating during deep sleep.
+         */
+        if (s_qmi8658_inited) {
+            esp_err_t wr = qmi8658_enable_wake_on_motion(&s_qmi8658, QMI8658_WOM_THRESHOLD_DEFAULT);
+            if (wr != ESP_OK) {
+                ESP_LOGW(TAG, "[SLEEP] QMI8658 enable WoM failed: %s", esp_err_to_name(wr));
+            }
+        }
+    }
+
+    /* --- 2) LCD off (backlight first, then controller) --- */
+    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
+    if (lcd_panel) {
+        (void)esp_lcd_panel_disp_on_off(lcd_panel, false);
+        (void)esp_lcd_panel_disp_sleep(lcd_panel, true);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    /* --- 3) Configure EXT1 wake (ANY_LOW) --- */
+    uint64_t mask = 0;
+    if (keep_touch_wake) mask |= (1ULL << (int)TOUCH_GPIO_INT);
+    if (keep_hdc_wake)   mask |= (1ULL << (int)HDC2080_IRQ);
+    /* Always allow IMU to wake (if present) */
+    if (s_qmi8658_inited) {
+        mask |= (1ULL << (int)IMU_INT1_GPIO);
+        mask |= (1ULL << (int)IMU_INT2_GPIO);
+    }
+
+    /* Ensure wake pins are inputs with pull-ups (active-low open-drain is typical). */
+    if (mask) {
+        gpio_config_t wake_gpio_cfg = {
+            .pin_bit_mask = mask,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&wake_gpio_cfg));
+
+        /* If any wake line is already asserted low, exclude it to avoid wake loops. */
+        if (keep_touch_wake && gpio_get_level(TOUCH_GPIO_INT) == 0) {
+            ESP_LOGW(TAG, "[SLEEP] Touch INT already LOW; excluding touch from EXT1 mask this cycle");
+            mask &= ~(1ULL << (int)TOUCH_GPIO_INT);
+        }
+        if (keep_hdc_wake && gpio_get_level(HDC2080_IRQ) == 0) {
+            ESP_LOGW(TAG, "[SLEEP] HDC2080 INT already LOW; excluding HDC2080 from EXT1 mask this cycle");
+            mask &= ~(1ULL << (int)HDC2080_IRQ);
+        }
+        if (s_qmi8658_inited && gpio_get_level(IMU_INT1_GPIO) == 0) {
+            ESP_LOGW(TAG, "[SLEEP] IMU INT1 already LOW; excluding IMU INT1 from EXT1 mask this cycle");
+            mask &= ~(1ULL << (int)IMU_INT1_GPIO);
+        }
+        if (s_qmi8658_inited && gpio_get_level(IMU_INT2_GPIO) == 0) {
+            ESP_LOGW(TAG, "[SLEEP] IMU INT2 already LOW; excluding IMU INT2 from EXT1 mask this cycle");
+            mask &= ~(1ULL << (int)IMU_INT2_GPIO);
+        }
+    }
+
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    if (mask) {
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+    }
+#else
+    if (mask) {
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+    }
+#endif
+
+    /* --- 4) Low-leakage GPIO configuration (keep wake pins intact) ---
+     * Strategy:
+     *  - Set known outputs to a safe inactive state
+     *  - Set most other pins to input with pull disabled
+     *  - DO NOT touch: TOUCH_GPIO_INT, HDC2080_IRQ (need pull-ups), I2C pins (if external pull-ups exist)
+     */
+
+    /* Keep BL off through deep sleep */
+    gpio_hold_en(LCD_GPIO_BL);
+    gpio_deep_sleep_hold_en();
+
+    /* Put LCD SPI pins to inputs to avoid leakage through the panel when MCU is off */
+    const gpio_num_t lcd_pins[] = { LCD_GPIO_SCLK, LCD_GPIO_MOSI, LCD_GPIO_DC, LCD_GPIO_CS, LCD_GPIO_RST };
+    for (size_t i = 0; i < sizeof(lcd_pins) / sizeof(lcd_pins[0]); i++) {
+        gpio_config_t c = {
+            .pin_bit_mask = 1ULL << (int)lcd_pins[i],
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        (void)gpio_config(&c);
+    }
+
+    /* Ensure wake pins are NOT held, and still have pull-ups enabled */
+    gpio_hold_dis(TOUCH_GPIO_INT);
+    gpio_hold_dis(HDC2080_IRQ);
+    if (s_qmi8658_inited) {
+        gpio_hold_dis(IMU_INT1_GPIO);
+        gpio_hold_dis(IMU_INT2_GPIO);
+    }
+
+    ESP_LOGI(TAG, "[SLEEP] Entering deep sleep; EXT1 mask=0x%016" PRIx64, mask);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_deep_sleep_start();
+}
