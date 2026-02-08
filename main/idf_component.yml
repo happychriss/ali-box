@@ -6,4 +6,4 @@ dependencies:
   espressif/esp_lvgl_port: '*'
 
   espressif/esp_lcd_touch_cst816s: ==1.1.1
-  waveshare/qmi8658: ==1.0.0
+  # waveshare/qmi8658 is replaced by local component `qmi8658_wom`

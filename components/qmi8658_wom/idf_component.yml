@@ -1,0 +1,6 @@
+version: "0.1.0"
+description: "QMI8658 sensor driver with Wake-on-Motion + INT1 configuration for deep-sleep wake"
+dependencies:
+  idf:
+    version: ">=5.5"
+
