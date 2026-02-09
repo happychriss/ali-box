@@ -293,7 +293,7 @@ static esp_err_t app_touch_init(void)
 {
     ESP_LOGI(TAG, "[TOUCH] CST816S init");
 
-    // Configure RST pin FIRST (before I2C init) to wake touch controller from deep sleep
+    // Configure RST pin first
     const gpio_config_t rst_cfg = {
         .pin_bit_mask = 1ULL << (int)TOUCH_RST_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -303,6 +303,7 @@ static esp_err_t app_touch_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&rst_cfg));
 
+    // Configure INT pin
     const gpio_config_t touch_int_cfg = {
         .pin_bit_mask = 1ULL << (int)TOUCH_GPIO_INT,
         .mode = GPIO_MODE_INPUT,
@@ -312,13 +313,17 @@ static esp_err_t app_touch_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&touch_int_cfg));
 
-    // Reset touch controller BEFORE I2C initialization (required when waking from deep sleep)
-    gpio_set_level(TOUCH_RST_PIN, !TOUCH_RST_ACTIVE_LEVEL);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    /* ===============================
+       CST816 RESET (active LOW)
+       =============================== */
+
+    // Assert reset
     gpio_set_level(TOUCH_RST_PIN, TOUCH_RST_ACTIVE_LEVEL);
-    vTaskDelay(pdMS_TO_TICKS(15));
+    vTaskDelay(pdMS_TO_TICKS(10));    // >=5ms per datasheet
+
+    // Release reset
     gpio_set_level(TOUCH_RST_PIN, !TOUCH_RST_ACTIVE_LEVEL);
-    vTaskDelay(pdMS_TO_TICKS(150)); // Allow touch controller to wake up before I2C init
+    vTaskDelay(pdMS_TO_TICKS(120));   // datasheet ~100ms boot time
 
     ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[I2C] init failed");
     vTaskDelay(pdMS_TO_TICKS(150)); // Allow touch controller to wake up before I2C init
@@ -341,10 +346,13 @@ static esp_err_t app_touch_init(void)
         .flags = {.swap_xy = 0, .mirror_x = 0, .mirror_y = 0}, /* No manual rotation */
     };
 
+
     // Create panel IO once per init call; reuse across attempts in this call.
+    app_i2c_init_shared();
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
     tp_io_config.scl_speed_hz = TOUCH_I2C_CLK_HZ;
+
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_handle, &tp_io_config, &tp_io_handle));
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &touch_handle));
 
@@ -1108,31 +1116,7 @@ static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool ke
     // Reading STATUS1 is the ONLY datasheet-defined way to reset the WoM toggle output.
     (void)qmi8658_wom_clear_status(&s_qmi8658);
 
-    // If a pin is already LOW, arming ANY_LOW can cause an immediate wake loop.
-    // Exclude it for this sleep cycle (preferred over sleeping into a loop).
-    if ((mask_low & (1ULL << (int)IMU_INT1_GPIO)) && gpio_get_level(IMU_INT1_GPIO) == 0)
-    {
-        ESP_LOGW(
-            TAG, "[SLEEP] IMU INT1 already LOW before sleep; clearing STATUS1 + delaying, then excluding if still LOW");
-        (void)qmi8658_wom_clear_status(&s_qmi8658);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        if (gpio_get_level(IMU_INT1_GPIO) == 0)
-        {
-            mask_low &= ~(1ULL << (int)IMU_INT1_GPIO);
-            ESP_LOGW(TAG, "[SLEEP] IMU INT1 still LOW; excluded from EXT1 mask for this cycle");
-        }
-    }
 
-    if ((mask_low & (1ULL << (int)TOUCH_GPIO_INT)) && gpio_get_level(TOUCH_GPIO_INT) == 0)
-    {
-        ESP_LOGW(TAG, "[SLEEP] Touch INT already LOW; excluding touch from EXT1 mask for this cycle");
-        mask_low &= ~(1ULL << (int)TOUCH_GPIO_INT);
-    }
-    if ((mask_low & (1ULL << (int)HDC2080_IRQ)) && gpio_get_level(HDC2080_IRQ) == 0)
-    {
-        ESP_LOGW(TAG, "[SLEEP] HDC2080 INT already LOW; excluding HDC2080 from EXT1 mask for this cycle");
-        mask_low &= ~(1ULL << (int)HDC2080_IRQ);
-    }
 
     ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
 
