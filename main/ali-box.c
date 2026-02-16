@@ -3,72 +3,40 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Cleaned for:
+ * Ali-Box Sensor Demo
  *  - LCD: 1.9", 170x320, ST7789V2, SPI
  *  - Touch: CST816S, I2C
- *  - LVGL 9.4: automatic input rotation (no manual transform needed)
- *  - Touch dot follows finger in all rotations
+ *  - Temp/Humidity: HDC2080, I2C
+ *  - IMU: QMI8658, I2C (Wake-on-Motion)
+ *  - LVGL 9.4
  */
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
-#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lvgl_port.h"
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 
-#include "qmi8658.h"
-
-#include "hdc2080.h"
-
-#include <stdio.h>  /* snprintf */
+#include <stdio.h>
 #include <inttypes.h>
 
-#include "freertos/semphr.h"  /* SemaphoreHandle_t */
+/* Component helpers */
+#include "lcd_helper.h"
+#include "touch_helper.h"
+#include "imu_helper.h"
+#include "hdc2080_helper.h"
 
-/* Image asset */
-LV_IMG_DECLARE(esp_logo);
+static const char *TAG = "MAIN";
 
-/* =========================================================
- * CST816S TOUCH (IRQ-driven read, per component README)
- * ========================================================= */
-#include "esp_lcd_touch_cst816s.h"
-
-static const char* TAG = "MAIN";
-
-/* === LCD native resolution (portrait) === */
-#define LCD_H_RES   (170)
-#define LCD_V_RES   (320)
-
-/* === PANEL GAP (RAM window offset) ===
- * This 170x320 ST7789 panel needs a RAM window offset ("gap").
- * Apply a different gap depending on orientation.
- */
-#define LCD_PORTRAIT_X_OFFSET  (35)
-#define LCD_PORTRAIT_Y_OFFSET  (0)
-#define LCD_LANDSCAPE_X_OFFSET (0)
-#define LCD_LANDSCAPE_Y_OFFSET (35)
-
-/* === LCD SPI settings === */
-#define LCD_SPI_NUM          (SPI3_HOST)
-#define LCD_PIXEL_CLK_HZ     (26 * 1000 * 1000)
-#define LCD_CMD_BITS         (8)
-#define LCD_PARAM_BITS       (8)
-#define LCD_BITS_PER_PIXEL   (16)
-#define LCD_DRAW_BUFF_DOUBLE (1)
-#define LCD_DRAW_BUFF_HEIGHT (40)
-#define LCD_BL_ON_LEVEL      (0)
-
-/* === LCD pins === */
+/* === Pin definitions === */
 #define LCD_GPIO_RST     (GPIO_NUM_9)
 #define LCD_GPIO_SCLK    (GPIO_NUM_10)
 #define LCD_GPIO_DC      (GPIO_NUM_11)
@@ -76,300 +44,419 @@ static const char* TAG = "MAIN";
 #define LCD_GPIO_MOSI    (GPIO_NUM_13)
 #define LCD_GPIO_BL      (GPIO_NUM_14)
 
-/* === Touch I2C settings === */
-#define TOUCH_I2C_NUM        (0)
-#define TOUCH_I2C_CLK_HZ     (400000)
-#define TOUCH_I2C_SDA        (GPIO_NUM_47)
-#define TOUCH_I2C_SCL        (GPIO_NUM_48)
-#define TOUCH_GPIO_INT       (GPIO_NUM_21)
-#define TOUCH_RST_PIN        (GPIO_NUM_17)
-
-// CST816S reset is active-low for this board
-#define TOUCH_RST_ACTIVE_LEVEL (0)
-
-/* === HDC2080 settings === */
-#define HDC2080_ADDR 0x40
-#define HDC2080_IRQ  (GPIO_NUM_15)
-#define TEMP_DELTA_WAKE_C    (2.f)
-#define DISPLAY_ON_MS        (3000)
-
-/* === IMU (QMI8658) interrupt pins ===
- * IMU INT1 = GPIO8, INT2 = GPIO7 (per user wiring).
- * Assumption for EXT1: interrupt is active-low (common open-drain).
- * If your wiring/config is active-high, switch EXT1 mode to ANY_HIGH.
- */
-#define IMU_INT1_GPIO        (GPIO_NUM_8)
+/* === LCD settings === */
+#define LCD_H_RES            (170)
+#define LCD_V_RES            (320)
+#define LCD_SPI_NUM          (SPI3_HOST)
+#define LCD_PIXEL_CLK_HZ     (26 * 1000 * 1000)
+#define LCD_DRAW_BUFF_HEIGHT (40)
+#define LCD_BL_ON_LEVEL      (0)
 
 
-/* Wake-on-motion sensitivity (library uses register 0x0B). Tune as needed. */
-#define QMI8658_WOM_THRESHOLD_DEFAULT (20)
+#define TOUCH_I2C_SDA    (GPIO_NUM_47)
+#define TOUCH_I2C_SCL    (GPIO_NUM_48)
+#define TOUCH_GPIO_INT   (GPIO_NUM_21)
+#define TOUCH_RST_PIN    (GPIO_NUM_17)
 
-/* Wake sources
- * Touch IRQ is on GPIO21 (TOUCH_GPIO_INT).
- * HDC2080 IRQ is on GPIO15 (HDC2080_IRQ).
- * Both can be configured as GPIO deep-sleep wake sources.
- */
+#define HDC2080_IRQ      (GPIO_NUM_15)
+#define IMU_INT1_GPIO    (GPIO_NUM_8)
 
-typedef enum
-{
-    APP_WAKE_UNKNOWN = 0,
-    APP_WAKE_TOUCH,
-    APP_WAKE_TEMP_THRESHOLD,
-    APP_WAKE_IMU,
-} app_wake_cause_t;
 
-static lv_obj_t* wakeup_label = NULL;
 
-static void app_wakeup_cause_ui_init(void);
-static void app_wakeup_cause_ui_set(app_wake_cause_t cause);
-static esp_err_t app_i2c_init_shared(void);
-static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_ticks);
-static void app_configure_gpio_wakeup_sources(void);
-static void app_prepare_for_deep_sleep(void);
-static void app_sleep_debug_dump_pins(void);
+/* === I2C settings === */
+#define I2C_NUM          (0)
+#define I2C_CLK_HZ       (400000)
 
-/* Touch visualizer (green dot) */
-static lv_obj_t* touch_dot = NULL;
-static lv_timer_t* touch_dot_timer = NULL;
+/* === Wake/sensor settings === */
+#define HDC2080_ADDR         (0x40)
+#define TEMP_DELTA_WAKE_C    (2.0f)
+#define WOM_THRESHOLD_MG     (20)
 
-/* Temp/humidity demo UI (kept separate from touch demo) */
-static lv_obj_t* temp_label = NULL;
-static lv_obj_t* hum_label = NULL;
+typedef enum {
+    WAKE_BOOT = 0,
+    WAKE_TOUCH,
+    WAKE_TEMP,
+    WAKE_IMU,
+    WAKE_OTHER,
+} wake_cause_t;
 
-static void app_touch_dot_update(int32_t x, int32_t y, bool pressed);
-static void app_touch_dot_timer_cb(lv_timer_t* t);
+/* Global handles */
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
+static lcd_helper_handle_t s_lcd = {0};
+static touch_helper_handle_t s_touch = {0};
+static imu_helper_handle_t s_imu = {0};
+static hdc2080_helper_handle_t s_hdc = {0};
+static lv_display_t *s_lvgl_disp = NULL;
+static lv_indev_t *s_lvgl_touch = NULL;
 
-/* Temperature display demo helpers */
-static void app_temp_display_ui_init(void);
-static void app_temp_display_update(float temp_c, float humidity_rh, bool sensor_ok);
-static void app_display_turn_on(void);
-static void app_display_turn_off(void);
-
-/* Handles */
-static esp_lcd_panel_io_handle_t lcd_io = NULL;
-static esp_lcd_panel_handle_t lcd_panel = NULL;
-static esp_lcd_touch_handle_t touch_handle = NULL;
-static lv_display_t* lvgl_disp = NULL;
-static lv_indev_t* lvgl_touch_indev = NULL;
-
-/* Shared I2C bus (created once; reused by touch + sensors) */
-static i2c_master_bus_handle_t i2c_bus_handle = NULL;
-
-static qmi8658_dev_t s_qmi8658 = {0};
-
-/* IRQ semaphore for CST816S (per component README) */
-static SemaphoreHandle_t touch_irq_sem = NULL;
+/* UI labels */
+static lv_obj_t *s_wake_label = NULL;
+static lv_obj_t *s_temp_label = NULL;
 
 /* Forward declarations */
-static esp_err_t app_lcd_init(void);
-static esp_err_t app_touch_init(void);
-static esp_err_t app_lvgl_init(void);
-static esp_err_t app_hdc2080_init(void);
-static void app_main_display(void);
-static void app_runtime_diag_task(void* arg);
-static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot);
-static void app_apply_rotation(lv_display_rotation_t rot);
-static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool keep_hdc_wake);
-
+static esp_err_t init_i2c(void);
+static esp_err_t init_lcd(void);
+static esp_err_t init_touch(void);
+static esp_err_t init_lvgl(void);
+static esp_err_t init_sensors(void);
+static wake_cause_t get_wakeup_cause(void);
+static const char *wake_cause_str(wake_cause_t cause);
+static void ui_init(void);
+static void ui_update(wake_cause_t cause, float temp_c, bool temp_ok);
+static bool wait_for_touch(uint32_t timeout_ms);
+static void prepare_imu_wom_from_deep_sleep(void);
+static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data);
 
 /* =========================================================
- * TOUCH ISR CALLBACK (CST816S README)
+ * I2C INIT
  * ========================================================= */
-static void touch_isr_callback(esp_lcd_touch_handle_t tp)
+static void i2c_bus_scan(void)
 {
-    (void)tp;
-    if (touch_irq_sem)
-    {
-        BaseType_t high_task_wake = pdFALSE;
-        xSemaphoreGiveFromISR(touch_irq_sem, &high_task_wake);
-        if (high_task_wake)
-        {
-            portYIELD_FROM_ISR();
+    if (!s_i2c_bus) return;
+
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    /* Temporarily suppress I2C error logs during scan */
+    esp_log_level_t old_level = esp_log_level_get("i2c.master");
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
+
+    uint8_t devices_found = 0;
+
+    for (uint8_t addr = 0x03; addr < 0x78; addr++) {
+        i2c_master_dev_handle_t dev_handle;
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 100000,
+        };
+
+        esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &dev_handle);
+        if (ret == ESP_OK) {
+            uint8_t dummy;
+            ret = i2c_master_receive(dev_handle, &dummy, 1, 100);
+            i2c_master_bus_rm_device(dev_handle);
+
+            if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
+                ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
+                devices_found++;
+            }
         }
     }
+    esp_log_level_set("i2c.master", old_level);
+
+
+    ESP_LOGI(TAG, "I2C scan complete: %d device(s) found", devices_found);
 }
 
-/* =========================================================
- * LVGL TOUCH CALLBACK (raw panel-native coords)
- * ========================================================= */
-/* LVGL 9.4: report RAW panel coordinates (rotation 0).
- * LVGL transforms automatically based on lv_display_set_rotation().
- */
-static void app_lvgl_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
+void touch_i2c_deinit(void)
 {
-    (void)indev;
-    data->state = LV_INDEV_STATE_RELEASED;
-
-    if (!touch_handle || !touch_irq_sem)
-    {
-        return;
-    }
-
-    /* Only read I2C after IRQ (CST816S responds briefly post-touch) */
-    if (xSemaphoreTake(touch_irq_sem, 0) == pdTRUE)
-    {
-        esp_lcd_touch_read_data(touch_handle);
-
-        esp_lcd_touch_point_data_t points[1];
-        uint8_t point_cnt = 0;
-
-        if (esp_lcd_touch_get_data(touch_handle, points, &point_cnt, 1) == ESP_OK &&
-            point_cnt > 0)
-        {
-            /*
-             * IMPORTANT:
-             * Report RAW panel-native coordinates here (rotation 0).
-             * LVGL will rotate/map them for widgets based on lv_display_set_rotation().
-             */
-            data->point.x = points[0].x;
-            data->point.y = points[0].y;
-            data->state = LV_INDEV_STATE_PRESSED;
-        }
+    /* Don't try to delete the I2C bus - device handles are still attached.
+     * Deep sleep will reset the I2C hardware peripheral anyway.
+     * Just mark as NULL so init_i2c() will reinitialize on wake.
+     */
+    if (s_i2c_bus) {
+        ESP_LOGI(TAG, "Marking I2C bus for re-init on wake (deep sleep will reset hardware)");
+        s_i2c_bus = NULL;
     }
 }
 
-/* =========================================================
- * LCD INIT
- * ========================================================= */
-static esp_err_t app_lcd_init(void)
+static esp_err_t init_i2c(void)
 {
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis(LCD_GPIO_BL);
+    /* After deep sleep, all RAM is cleared so s_i2c_bus will be NULL.
+     * No need to check wake cause - just proceed with init if NULL.
+     */
+    if (s_i2c_bus) {
+        ESP_LOGI(TAG, "I2C bus already initialized");
+        return ESP_OK;
+    }
 
-    ESP_LOGI(TAG, "[LCD] Init!! %dx%d ST7789", LCD_H_RES, LCD_V_RES);
+    /* Release GPIO holds from deep sleep */
+    gpio_hold_dis(TOUCH_I2C_SDA);
+    gpio_hold_dis(TOUCH_I2C_SCL);
+    gpio_hold_dis(TOUCH_RST_PIN);
+    gpio_hold_dis(TOUCH_GPIO_INT);
 
-    /* Backlight GPIO */
-    gpio_config_t bk_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LCD_GPIO_BL
-    };
-    ESP_ERROR_CHECK(gpio_config(&bk_config));
-    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
-
-    /* SPI bus */
-    const spi_bus_config_t buscfg = {
-        .sclk_io_num = LCD_GPIO_SCLK,
-        .mosi_io_num = LCD_GPIO_MOSI,
-        .miso_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT * 2,
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
-
-    /* Panel IO */
-    const esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = LCD_GPIO_DC,
-        .cs_gpio_num = LCD_GPIO_CS,
-        .pclk_hz = LCD_PIXEL_CLK_HZ,
-        .lcd_cmd_bits = LCD_CMD_BITS,
-        .lcd_param_bits = LCD_PARAM_BITS,
-        .spi_mode = 0,
-        .trans_queue_depth = 10,
-    };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_NUM, &io_config, &lcd_io));
-
-    /* ST7789 panel */
-    const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = LCD_GPIO_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = LCD_BITS_PER_PIXEL,
-    };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &lcd_panel));
-
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, false, false));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel, true));
-
-    /* Backlight ON */
-    gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL);
-
-    return ESP_OK;
-}
-
-/* =========================================================
- * TOUCH INIT
- * ========================================================= */
-static esp_err_t app_touch_init(void)
-{
-    ESP_LOGI(TAG, "[TOUCH] CST816S init");
-
-    // Configure RST pin first
+    /* Configure RST pin FIRST and hold chip in reset during I2C recovery */
+    ESP_LOGI(TAG, "Holding CST816S in reset during init...");
     const gpio_config_t rst_cfg = {
-        .pin_bit_mask = 1ULL << (int)TOUCH_RST_PIN,
+        .pin_bit_mask = 1ULL << TOUCH_RST_PIN,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&rst_cfg));
+    gpio_set_level(TOUCH_RST_PIN, 0);  // Hold in reset immediately
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Configure INT pin
-    const gpio_config_t touch_int_cfg = {
-        .pin_bit_mask = 1ULL << (int)TOUCH_GPIO_INT,
+    /* I2C bus recovery - based on Forward Computing method
+     * http://www.forward.com.au/pfod/ArduinoProgramming/I2C_ClearBus/index.html
+     */
+    ESP_LOGI(TAG, "I2C bus recovery starting...");
+
+    gpio_reset_pin(TOUCH_I2C_SDA);
+    gpio_reset_pin(TOUCH_I2C_SCL);
+    gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_PULLUP_ONLY);
+    gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+    gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+
+    /* Wait for pins to stabilize */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Check if SCL is held low */
+    if (gpio_get_level(TOUCH_I2C_SCL) == 0) {
+        ESP_LOGE(TAG, "I2C bus error: SCL held low - cannot become master");
+        return ESP_FAIL;
+    }
+
+    /* Check if SDA is held low (stuck transaction) */
+    bool sda_low = (gpio_get_level(TOUCH_I2C_SDA) == 0);
+    if (sda_low) {
+        ESP_LOGW(TAG, "SDA stuck low - attempting recovery...");
+
+        int clock_count = 20; // Max 20 clock pulses (> 2x9 bits)
+
+        while (sda_low && (clock_count > 0)) {
+            clock_count--;
+
+            /* Clock SCL low using INPUT->OUTPUT_OD method to avoid driving HIGH */
+            gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_FLOATING);  // Remove pullup
+            gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_OUTPUT_OD);
+            gpio_set_level(TOUCH_I2C_SCL, 0);  // Drive low
+            esp_rom_delay_us(10);  // >5us
+
+            /* Release SCL (let pullup bring it high) */
+            gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+            gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_PULLUP_ONLY);
+            esp_rom_delay_us(10);  // >5us
+
+            /* Wait for SCL to go high (handle clock stretching) */
+            int stretch_count = 200;  // 200 * 10ms = 2sec timeout
+            while (gpio_get_level(TOUCH_I2C_SCL) == 0 && stretch_count > 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                stretch_count--;
+            }
+
+            if (gpio_get_level(TOUCH_I2C_SCL) == 0) {
+                ESP_LOGE(TAG, "I2C bus error: SCL held low by clock stretch >2sec");
+                return ESP_FAIL;
+            }
+
+            /* Check if SDA released */
+            sda_low = (gpio_get_level(TOUCH_I2C_SDA) == 0);
+            if (!sda_low) {
+                ESP_LOGI(TAG, "SDA released after %d clock pulses", 20 - clock_count);
+                break;
+            }
+        }
+
+        if (sda_low) {
+            ESP_LOGE(TAG, "I2C bus error: SDA still held low after 20 clocks");
+            return ESP_FAIL;
+        }
+    } else {
+        ESP_LOGI(TAG, "SDA is HIGH - bus looks clean");
+    }
+
+    /* Send I2C STOP condition to reset all devices */
+    ESP_LOGI(TAG, "Sending I2C STOP condition...");
+
+    /* Pull SDA low (START condition) */
+    gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_FLOATING);
+    gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(TOUCH_I2C_SDA, 0);
+    esp_rom_delay_us(10);  // >5us
+
+    /* Release SDA (STOP condition) */
+    gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_PULLUP_ONLY);
+    esp_rom_delay_us(10);  // >5us
+
+    /* Reset pins to tri-state inputs (default state) */
+    gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_FLOATING);
+    gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_FLOATING);
+    gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+    gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+
+    ESP_LOGI(TAG, "I2C bus recovery complete");
+
+    /* CST816S power and pin initialization
+     * Configure INT pin first to prevent holding chip in boot mode
+     */
+    ESP_LOGI(TAG, "CST816S initialization starting...");
+
+    /* Configure INT pin as input with pull-up (chip may check this during power-up) */
+    const gpio_config_t int_cfg = {
+        .pin_bit_mask = 1ULL << TOUCH_GPIO_INT,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_ERROR_CHECK(gpio_config(&touch_int_cfg));
+    ESP_ERROR_CHECK(gpio_config(&int_cfg));
+    ESP_LOGI(TAG, "  INT pin configured as input with pull-up");
 
-    /* ===============================
-       CST816 RESET (active LOW)
-       =============================== */
+    /* Wait for power rail to stabilize (critical on cold boot) */
+    ESP_LOGI(TAG, "  Waiting 200ms for power rail stabilization...");
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    // Assert reset
-    gpio_set_level(TOUCH_RST_PIN, TOUCH_RST_ACTIVE_LEVEL);
-    vTaskDelay(pdMS_TO_TICKS(10));    // >=5ms per datasheet
+    ESP_ERROR_CHECK(gpio_config(&rst_cfg));
 
-    // Release reset
-    gpio_set_level(TOUCH_RST_PIN, !TOUCH_RST_ACTIVE_LEVEL);
-    vTaskDelay(pdMS_TO_TICKS(120));   // datasheet ~100ms boot time
+    /* Try INVERTED reset polarity (active-HIGH) first
+     * Some CST816S modules may have inverted reset logic
+     */
+    ESP_LOGI(TAG, "  Attempting reset with INVERTED polarity (active-HIGH)...");
+    ESP_LOGI(TAG, "  Step 1: Set RST LOW (idle state for active-HIGH)");
+    gpio_set_level(TOUCH_RST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[I2C] init failed");
-    vTaskDelay(pdMS_TO_TICKS(150)); // Allow touch controller to wake up before I2C init
+    ESP_LOGI(TAG, "  Step 2: Assert RESET HIGH for 200ms");
+    gpio_set_level(TOUCH_RST_PIN, 1);  // Try active-HIGH reset
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    // If we're reinitializing (e.g., after a failed attempt), clean up the old handle.
-    if (touch_handle)
-    {
-        esp_lcd_touch_del(touch_handle);
-        touch_handle = NULL;
-    }
+    ESP_LOGI(TAG, "  Step 3: Release RESET (back to LOW)");
+    gpio_set_level(TOUCH_RST_PIN, 0);
 
-    /* Touch config (RAW panel-native, LVGL rotates automatically) */
-    const esp_lcd_touch_config_t tp_cfg = {
-        .x_max = LCD_H_RES,
-        .y_max = LCD_V_RES,
-        .rst_gpio_num = TOUCH_RST_PIN,
-        .int_gpio_num = TOUCH_GPIO_INT,
-        .interrupt_callback = touch_isr_callback,
-        .levels = {.reset = TOUCH_RST_ACTIVE_LEVEL, .interrupt = 0},
-        .flags = {.swap_xy = 0, .mirror_x = 0, .mirror_y = 0}, /* No manual rotation */
+    ESP_LOGI(TAG, "  Step 4: Waiting 800ms for CST816S boot...");
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    const i2c_master_bus_config_t cfg = {
+        .i2c_port = I2C_NUM,
+        .sda_io_num = TOUCH_I2C_SDA,
+        .scl_io_num = TOUCH_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .flags.enable_internal_pullup = true,
     };
 
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&cfg, &s_i2c_bus),
+                        TAG, "I2C bus init failed");
+    ESP_LOGI(TAG, "I2C bus ready");
 
-    // Create panel IO once per init call; reuse across attempts in this call.
-    app_i2c_init_shared();
-    esp_lcd_panel_io_handle_t tp_io_handle = NULL;
-    esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
-    tp_io_config.scl_speed_hz = TOUCH_I2C_CLK_HZ;
+    /* Scan immediately to verify CST816S appears at 0x15 */
+    i2c_bus_scan();
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_handle, &tp_io_config, &tp_io_handle));
-    ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &touch_handle));
+    /* Probe for CST816S at both possible addresses */
+    bool cst816s_found = false;
+    uint8_t cst816s_addr = 0x15;
 
+    for (uint8_t addr = 0x14; addr <= 0x15; addr++) {
+        ESP_LOGI(TAG, "Probing CST816S at address 0x%02X...", addr);
+        i2c_master_dev_handle_t test_dev;
+        i2c_device_config_t test_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 100000,
+        };
 
-    // Clean up any partially-created handle before retrying.
-    if (touch_handle)
-    {
-        esp_lcd_touch_del(touch_handle);
-        touch_handle = NULL;
+        esp_err_t probe_ret = i2c_master_bus_add_device(s_i2c_bus, &test_cfg, &test_dev);
+        if (probe_ret == ESP_OK) {
+            uint8_t dummy;
+            probe_ret = i2c_master_receive(test_dev, &dummy, 1, 100);
+            i2c_master_bus_rm_device(test_dev);
+
+            if (probe_ret == ESP_OK || probe_ret == ESP_ERR_TIMEOUT) {
+                ESP_LOGI(TAG, "✓ CST816S FOUND at 0x%02X!", addr);
+                cst816s_found = true;
+                cst816s_addr = addr;
+                break;
+            } else {
+                ESP_LOGW(TAG, "✗ CST816S at 0x%02X NACKed: %s", addr, esp_err_to_name(probe_ret));
+            }
+        } else {
+            ESP_LOGW(TAG, "✗ Failed to add CST816S device at 0x%02X: %s", addr, esp_err_to_name(probe_ret));
+        }
     }
 
+    if (!cst816s_found) {
+        ESP_LOGE(TAG, "✗✗✗ CST816S NOT FOUND on I2C bus! ✗✗✗");
+        ESP_LOGE(TAG, "This indicates a hardware issue:");
+        ESP_LOGE(TAG, "  1. Touch controller power issue (VDD not stable)");
+        ESP_LOGE(TAG, "  2. Reset pin (GPIO%d) not connected to chip", TOUCH_RST_PIN);
+        ESP_LOGE(TAG, "  3. Wrong I2C pins (using GPIO%d/GPIO%d)", TOUCH_I2C_SDA, TOUCH_I2C_SCL);
+        ESP_LOGE(TAG, "  4. Touch controller damaged or in boot loader mode");
+    } else {
+        ESP_LOGI(TAG, "CST816S confirmed at address 0x%02X", cst816s_addr);
+    }
 
-    // All attempts failed; free IO handle so we don't leak devices across reboots/retries.
-    if (tp_io_handle)
-    {
-        (void)esp_lcd_panel_io_del(tp_io_handle);
-        tp_io_handle = NULL;
+    return ESP_OK;
+}
+
+
+/* =========================================================
+ * LCD INIT
+ * ========================================================= */
+static esp_err_t init_lcd(void)
+{
+    const lcd_helper_config_t cfg = {
+        .spi_host = LCD_SPI_NUM,
+        .pixel_clk_hz = LCD_PIXEL_CLK_HZ,
+        .cmd_bits = 8,
+        .param_bits = 8,
+        .bits_per_pixel = 16,
+        .draw_buff_height = LCD_DRAW_BUFF_HEIGHT,
+        .gpio_rst = LCD_GPIO_RST,
+        .gpio_sclk = LCD_GPIO_SCLK,
+        .gpio_dc = LCD_GPIO_DC,
+        .gpio_cs = LCD_GPIO_CS,
+        .gpio_mosi = LCD_GPIO_MOSI,
+        .gpio_bl = LCD_GPIO_BL,
+        .bl_on_level = LCD_BL_ON_LEVEL,
+        .h_res = LCD_H_RES,
+        .v_res = LCD_V_RES,
+        .portrait_x_offset = 35,
+        .portrait_y_offset = 0,
+        .landscape_x_offset = 0,
+        .landscape_y_offset = 35,
+    };
+
+    return lcd_helper_init(&cfg, &s_lcd);
+}
+
+/* =========================================================
+ * TOUCH INIT
+ * ========================================================= */
+static esp_err_t init_touch(void)
+{
+    const touch_helper_config_t cfg = {
+        .i2c_bus = s_i2c_bus,
+        .i2c_clk_hz = I2C_CLK_HZ,
+        .gpio_int = TOUCH_GPIO_INT,
+        .gpio_rst = TOUCH_RST_PIN,
+        .rst_active_level = 0,
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
+        .skip_hw_reset = true,  // Already done in init_i2c()
+    };
+
+    return touch_helper_init(&cfg, &s_touch);
+}
+
+/* =========================================================
+ * SENSORS INIT (HDC2080 + IMU)
+ * ========================================================= */
+static esp_err_t init_sensors(void)
+{
+    /* HDC2080 */
+    const hdc2080_helper_config_t hdc_cfg = {
+        .i2c_bus = s_i2c_bus,
+        .i2c_addr = HDC2080_ADDR,
+        .gpio_irq = HDC2080_IRQ,
+    };
+    esp_err_t ret = hdc2080_helper_init(&hdc_cfg, &s_hdc);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "HDC2080 init failed (optional)");
+    }
+
+    /* IMU */
+    const imu_helper_config_t imu_cfg = {
+        .i2c_bus = s_i2c_bus,
+        .gpio_int1 = IMU_INT1_GPIO,
+        .wom_threshold_mg = WOM_THRESHOLD_MG,
+        .wom_blanking_samples = 3,
+    };
+    ret = imu_helper_init(&imu_cfg, &s_imu);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "IMU init failed (optional)");
     }
 
     return ESP_OK;
@@ -378,875 +465,750 @@ static esp_err_t app_touch_init(void)
 /* =========================================================
  * LVGL INIT
  * ========================================================= */
-static esp_err_t app_lvgl_init(void)
-
+static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    ESP_LOGI(TAG, "[LVGL] Init v%d.%d.%d", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
-    // return with error if not version 9.4.x
-#if LVGL_VERSION_MAJOR != 9 || LVGL_VERSION_MINOR != 4
-    ESP_LOGE(TAG, "LVGL version 9.4.x required");
-    return ESP_ERR_INVALID_VERSION;
-#endif
+    (void)indev;
+    data->state = LV_INDEV_STATE_RELEASED;
+
+    int32_t x, y;
+    if (touch_helper_read(&s_touch, &x, &y)) {
+        data->point.x = x;
+        data->point.y = y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
+}
+
+static esp_err_t init_lvgl(void)
+{
+    ESP_LOGI(TAG, "LVGL v%d.%d.%d init", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
 
     const lvgl_port_cfg_t lvgl_cfg = {
         .task_priority = 4,
         .task_stack = 8192,
-        .timer_period_ms = 5
+        .timer_period_ms = 5,
     };
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
-    ESP_LOGI(TAG, "[LVGL] Port initialized");
 
-    /* Display */
     const lvgl_port_display_cfg_t disp_cfg = {
-        .io_handle = lcd_io,
-        .panel_handle = lcd_panel,
+        .io_handle = s_lcd.io,
+        .panel_handle = s_lcd.panel,
         .buffer_size = LCD_H_RES * LCD_DRAW_BUFF_HEIGHT,
-        .double_buffer = LCD_DRAW_BUFF_DOUBLE,
+        .double_buffer = 1,
         .hres = LCD_H_RES,
         .vres = LCD_V_RES,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .flags.buff_dma = true,
         .flags.swap_bytes = true,
     };
-    lvgl_disp = lvgl_port_add_disp(&disp_cfg);
-    ESP_LOGI(TAG, "[LVGL] Display added");
+    s_lvgl_disp = lvgl_port_add_disp(&disp_cfg);
 
-    /* Default: 90° landscape (your preference) */
-    app_apply_rotation(LV_DISPLAY_ROTATION_90);
+    /* Apply 90° landscape rotation */
+    lcd_helper_apply_gap_for_rotation(&s_lcd, 90);
+    lv_display_set_rotation(s_lvgl_disp, LV_DISPLAY_ROTATION_90);
 
-    /* Touch input device */
-    lvgl_touch_indev = lv_indev_create();
-    lv_indev_set_type(lvgl_touch_indev, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_display(lvgl_touch_indev, lvgl_disp);
-    lv_indev_set_read_cb(lvgl_touch_indev, app_lvgl_touch_read_cb);
-    ESP_LOGI(TAG, "[LVGL] Touch input device added");
+    /* Touch input */
+    s_lvgl_touch = lv_indev_create();
+    lv_indev_set_type(s_lvgl_touch, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_display(s_lvgl_touch, s_lvgl_disp);
+    lv_indev_set_read_cb(s_lvgl_touch, lvgl_touch_read_cb);
 
-    /*
-     * Touch-dot updater:
-     * The indev read callback receives/stores RAW coordinates.
-     * To draw in the rotated UI coordinate system, query LVGL for the processed
-     * pointer point and draw from that.
-     */
-    touch_dot_timer = lv_timer_create(app_touch_dot_timer_cb, 16, NULL);
-
-    ESP_LOGI(TAG, "[LVGL] Init done");
+    ESP_LOGI(TAG, "LVGL initialized");
     return ESP_OK;
 }
 
 /* =========================================================
- * Temperature-display-only UI helpers
- * (kept separate from TOUCH_DISPLAY_DEMO)
+ * WAKEUP CAUSE
  * ========================================================= */
-static void app_display_turn_on(void)
+static wake_cause_t get_wakeup_cause(void)
 {
-    if (lcd_panel)
-    {
-        (void)esp_lcd_panel_disp_on_off(lcd_panel, true);
+    esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+
+    if (wc == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        return WAKE_BOOT;
     }
-    gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL);
+
+    if (wc == ESP_SLEEP_WAKEUP_EXT1) {
+        uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+        if (mask & (1ULL << TOUCH_GPIO_INT)) return WAKE_TOUCH;
+        if (mask & (1ULL << HDC2080_IRQ)) return WAKE_TEMP;
+        if (mask & (1ULL << IMU_INT1_GPIO)) return WAKE_IMU;
+    }
+
+    return WAKE_OTHER;
 }
 
-static void app_display_turn_off(void)
+static const char *wake_cause_str(wake_cause_t cause)
 {
-    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
-    if (lcd_panel)
-    {
-        (void)esp_lcd_panel_disp_on_off(lcd_panel, false);
-    }
-}
-
-static void app_temp_display_ui_init(void)
-{
-    lvgl_port_lock(0);
-
-    lv_obj_t* scr = lv_scr_act();
-    lv_obj_clean(scr);
-
-    lv_obj_t* title = lv_label_create(scr);
-    lv_label_set_text(title, "HDC2080");
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
-
-    /* Wakeup cause line (small) */
-    wakeup_label = lv_label_create(scr);
-    lv_label_set_text(wakeup_label, "Wake: --");
-    lv_obj_set_style_text_align(wakeup_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(wakeup_label, LV_ALIGN_TOP_MID, 0, 36);
-
-    temp_label = lv_label_create(scr);
-    lv_label_set_text(temp_label, "Temp: --.-- C");
-    lv_obj_align(temp_label, LV_ALIGN_CENTER, 0, -10);
-
-    hum_label = lv_label_create(scr);
-    lv_label_set_text(hum_label, "Humidity: --.-- %RH");
-    lv_obj_align(hum_label, LV_ALIGN_CENTER, 0, 20);
-
-    lvgl_port_unlock();
-}
-
-static void app_temp_display_update(float temp_c, float humidity_rh, bool sensor_ok)
-{
-    if (!temp_label || !hum_label)
-    {
-        return;
-    }
-
-    char buf1[48];
-    char buf2[48];
-
-    if (!sensor_ok)
-    {
-        snprintf(buf1, sizeof(buf1), "Temp: (sensor missing)");
-        snprintf(buf2, sizeof(buf2), "Humidity: (sensor missing)");
-    }
-    else
-    {
-        snprintf(buf1, sizeof(buf1), "Temp: %.2f C", (double)temp_c);
-        snprintf(buf2, sizeof(buf2), "Humidity: %.2f %%RH", (double)humidity_rh);
-    }
-
-    lvgl_port_lock(0);
-    lv_label_set_text(temp_label, buf1);
-    lv_label_set_text(hum_label, buf2);
-    lvgl_port_unlock();
-}
-
-/* =========================================================
- * Wakeup cause helpers
- * ========================================================= */
-static void app_wakeup_cause_ui_init(void)
-{
-    /* Created by app_temp_display_ui_init(); kept for symmetry if the UI changes later. */
-}
-
-static void app_wakeup_cause_ui_set(app_wake_cause_t cause)
-{
-    if (!wakeup_label) return;
-
-    const char* txt = "Wake: ?";
-    switch (cause)
-    {
-    case APP_WAKE_TOUCH: txt = "Wake: touch";
-        break;
-    case APP_WAKE_TEMP_THRESHOLD: txt = "Wake: temp";
-        break;
-    case APP_WAKE_IMU: txt = "Wake: motion";
-        break;
-    default: txt = "Wake: unknown";
-        break;
-    }
-
-    lvgl_port_lock(0);
-    lv_label_set_text(wakeup_label, txt);
-    lvgl_port_unlock();
-}
-
-static void app_configure_gpio_wakeup_sources(void)
-{
-    /* Configure only the HDC2080 IRQ pin here to keep init simple.
-     * HDC2080 INT is typically open-drain active-low, so ensure a pull-up.
-     */
-    const gpio_config_t hdc_irq_cfg = {
-        .pin_bit_mask = 1ULL << HDC2080_IRQ,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&hdc_irq_cfg));
-
-    /* IMPORTANT:
-     * gpio_wakeup_enable() touches GPIO interrupt configuration.
-     * If an IRQ line is already active (e.g. touch INT stuck low), doing this while
-     * the ISR service is running can lead to ISR contention and interrupt WDT.
-     *
-     * So we only call this as part of the deep-sleep transition, after disabling
-     * runtime touch IRQ handling.
-     */
-    ESP_ERROR_CHECK(gpio_wakeup_enable(TOUCH_GPIO_INT, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK(gpio_wakeup_enable(HDC2080_IRQ, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
-
-    ESP_LOGI(TAG, "[SLEEP] GPIO wake armed: touch=%d, hdc2080=%d (low-level)",
-             (int)TOUCH_GPIO_INT, (int)HDC2080_IRQ);
-}
-
-static void app_prepare_for_deep_sleep(void)
-{
-    /* Stop runtime IRQ-driven touch reads before reconfiguring GPIOs for wake. */
-    (void)gpio_intr_disable(TOUCH_GPIO_INT);
-
-    if (touch_irq_sem)
-    {
-        xSemaphoreTake(touch_irq_sem, 0);
-    }
-
-    app_configure_gpio_wakeup_sources();
-}
-
-static esp_err_t app_i2c_init_shared(void)
-{
-    if (i2c_bus_handle != NULL)
-    {
-        return ESP_OK;
-    }
-
-    const i2c_master_bus_config_t i2c_config = {
-        .i2c_port = TOUCH_I2C_NUM,
-        .sda_io_num = TOUCH_I2C_SDA,
-        .scl_io_num = TOUCH_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .flags.enable_internal_pullup = true,
-    };
-
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_config, &i2c_bus_handle), TAG, "[I2C] new bus failed");
-    ESP_LOGI(TAG, "[I2C] Master bus ready on I2C%d (SDA=%d SCL=%d)",
-             TOUCH_I2C_NUM, (int)TOUCH_I2C_SDA, (int)TOUCH_I2C_SCL);
-
-    // Scan I2C bus for devices
-    ESP_LOGI(TAG, "[I2C] Scanning bus...");
-    uint8_t found = 0;
-    for (uint8_t addr = 0x08; addr <= 0x77; addr++)
-    {
-        if (i2c_master_probe(i2c_bus_handle, addr, 50) == ESP_OK)
-        {
-            ESP_LOGI(TAG, "[I2C] Device found at 0x%02X", addr);
-            found++;
-        }
-    }
-    ESP_LOGI(TAG, "[I2C] Scan complete: %d device(s) found", found);
-
-    return ESP_OK;
-}
-
-static esp_err_t app_qmi8658_init_optional(void)
-{
-    /* Reuse the existing shared I2C bus (same as touch + HDC2080). */
-    ESP_RETURN_ON_ERROR(app_i2c_init_shared(), TAG, "[IMU] I2C init failed");
-
-    /* Configure IMU INT1 as input with PULL-UP.
-     * We use EXT1 ANY_LOW for wake, so the inactive level must be HIGH.
-     */
-
-    app_sleep_debug_dump_pins();
-    const gpio_config_t imu_int_cfg = {
-        .pin_bit_mask = (1ULL << (int)IMU_INT1_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&imu_int_cfg));
-
-    /* Try both common I2C addresses (0x6B then 0x6A). */
-    esp_err_t ret = qmi8658_init(&s_qmi8658, i2c_bus_handle, QMI8658_ADDRESS_HIGH);
-    if (ret != ESP_OK)
-    {
-        ret = qmi8658_init(&s_qmi8658, i2c_bus_handle, QMI8658_ADDRESS_LOW);
-        ESP_LOGW(TAG, "[IMU] QMI8658 init failed (using alternate address 0x6A): %s", esp_err_to_name(ret));
-    }
-
-    if (ret == ESP_OK)
-    {
-        ESP_LOGI(TAG, "[IMU] QMI8658 initialized INT1=GPIO%d", (int)IMU_INT1_GPIO);
-        app_sleep_debug_dump_pins();
-    }
-    else
-    {
-        ESP_LOGW(TAG, "[IMU] QMI8658 not detected/init failed: %s (IMU wake disabled)", esp_err_to_name(ret));
-    }
-
-    return ret;
-}
-
-static void app_note_activity(app_wake_cause_t cause, TickType_t* last_activity_ticks)
-{
-    if (last_activity_ticks)
-    {
-        *last_activity_ticks = xTaskGetTickCount();
-    }
-
-    app_display_turn_on();
-    app_wakeup_cause_ui_set(cause);
-
-    if (cause == APP_WAKE_TOUCH)
-    {
-        ESP_LOGI(TAG, "[UI] Touch activity -> display on for %d ms", DISPLAY_ON_MS);
-    }
-    else if (cause == APP_WAKE_TEMP_THRESHOLD)
-    {
-        ESP_LOGI(TAG, "[UI] Temp threshold activity -> display on for %d ms", DISPLAY_ON_MS);
+    switch (cause) {
+        case WAKE_BOOT:  return "Boot";
+        case WAKE_TOUCH: return "Touch";
+        case WAKE_TEMP:  return "Temperature";
+        case WAKE_IMU:   return "Motion (IMU)";
+        default:         return "Other";
     }
 }
 
 /* =========================================================
  * UI
  * ========================================================= */
-static void app_button_cb(lv_event_t* e)
-{
-    (void)e;
-    lv_display_rotation_t rot = lv_display_get_rotation(lvgl_disp);
-    rot = (rot + 1) % 4; /* 0→1→2→3→0 */
-    app_apply_rotation(rot);
-    ESP_LOGI(TAG, "[UI] Rotation → %d", (int)rot);
-}
-
-static void app_main_display(void)
+static void ui_init(void)
 {
     lvgl_port_lock(0);
 
-    lv_obj_t* scr = lv_scr_act();
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
 
-    /* Logo */
-    lv_obj_t* logo = lv_img_create(scr);
-    lv_img_set_src(logo, &esp_logo);
-    lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "Ali-Box Sensor");
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
-    /* Status */
-    lv_obj_t* label = lv_label_create(scr);
-    lv_label_set_text(label, "ST7789 + CST816S + LVGL 9.4\nTouch anywhere (green dot)\nRotate button");
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 20);
+    s_wake_label = lv_label_create(scr);
+    lv_label_set_text(s_wake_label, "Wake: --");
+    lv_obj_set_style_text_align(s_wake_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wake_label, LV_ALIGN_TOP_MID, 0, 35);
 
-    /* Rotate button */
-    lv_obj_t* btn = lv_btn_create(scr);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_add_event_cb(btn, app_button_cb, LV_EVENT_CLICKED, NULL);
+    s_temp_label = lv_label_create(scr);
+    lv_label_set_text(s_temp_label, "Temp: --.-- C");
+    lv_obj_set_style_text_align(s_temp_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_temp_label, LV_ALIGN_CENTER, 0, 0);
 
-    lv_obj_t* btn_lbl = lv_label_create(btn);
-    lv_label_set_text(btn_lbl, "Rotate");
-
-    /* Touch dot visualizer */
-    touch_dot = lv_obj_create(scr);
-    lv_obj_set_size(touch_dot, 8, 8);
-    lv_obj_set_style_radius(touch_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(touch_dot, lv_color_hex(0x00FF00), 0);
-    lv_obj_set_style_bg_opa(touch_dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(touch_dot, 0, 0);
-    lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *hint = lv_label_create(scr);
+    lv_label_set_text(hint, "Touch to sleep...");
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
     lvgl_port_unlock();
 }
 
+static void ui_update(wake_cause_t cause, float temp_c, bool temp_ok)
+{
+    if (!s_wake_label || !s_temp_label) return;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Wake: %s", wake_cause_str(cause));
+
+    lvgl_port_lock(0);
+    lv_label_set_text(s_wake_label, buf);
+
+    if (temp_ok) {
+        snprintf(buf, sizeof(buf), "Temp: %.1f C", (double)temp_c);
+    } else {
+        snprintf(buf, sizeof(buf), "Temp: (sensor error)");
+    }
+    lv_label_set_text(s_temp_label, buf);
+    lvgl_port_unlock();
+}
 
 /* =========================================================
- * RUNTIME DIAGNOSTICS
+ * WAIT FOR TOUCH
  * ========================================================= */
-/* Optional: call this right before deep sleep to log the levels you are about to arm with */
-static void app_sleep_debug_dump_pins(void)
+static bool wait_for_touch(uint32_t timeout_ms)
 {
-    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
-    const int hdc_lvl = gpio_get_level(HDC2080_IRQ);
-    const int imu1_lvl = gpio_get_level(IMU_INT1_GPIO);
-    ESP_LOGI(TAG, "[SLEEP] Pin levels: touch GPIO%d=%d, hdc GPIO%d=%d, imu1 GPIO%d=%d",
-             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl, (int)IMU_INT1_GPIO, imu1_lvl);
-}
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
 
-static void app_wake_debug_dump_ext1(void)
-{
-    const esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
-    ESP_LOGI(TAG, "[WAKE] cause=%d", (int)wc);
-
-    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
-    const int hdc_lvl = gpio_get_level(HDC2080_IRQ);
-    const int imu1_lvl = gpio_get_level(IMU_INT1_GPIO);
-
-    ESP_LOGI(TAG, "[WAKE] boot pin levels: touch GPIO%d=%d, hdc GPIO%d=%d, imu1 GPIO%d=%d",
-             (int)TOUCH_GPIO_INT, touch_lvl, (int)HDC2080_IRQ, hdc_lvl,
-             (int)IMU_INT1_GPIO, imu1_lvl);
-
-    // WoM: reading STATUS1 clears STATUS1.WoM and restores the INT line to its configured initial level.
-    (void)qmi8658_wom_clear_status(&s_qmi8658);
-
-    if (wc == ESP_SLEEP_WAKEUP_EXT1)
-    {
-        const uint64_t m = esp_sleep_get_ext1_wakeup_status();
-        ESP_LOGI(TAG, "[WAKE] ext1 wake mask=0x%016" PRIx64, m);
-
-        const bool touch_hit = (m & (1ULL << (int)TOUCH_GPIO_INT)) != 0;
-        const bool hdc_hit = (m & (1ULL << (int)HDC2080_IRQ)) != 0;
-        const bool imu1_hit = (m & (1ULL << (int)IMU_INT1_GPIO)) != 0;
-        ESP_LOGI(TAG, "[WAKE] ext1 bits: touch=%d, hdc=%d, imu1=%d",
-                 (int)touch_hit, (int)hdc_hit, (int)imu1_hit);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        lv_indev_state_t st = lv_indev_get_state(s_lvgl_touch);
+        if (st == LV_INDEV_STATE_PRESSED) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+    return false;
 }
 
-static void app_configure_wakeup_sources_ext1_lowlevel(void)
+/* =========================================================
+ * DEEP SLEEP PREPARATION (IMU wake only)
+ * ========================================================= */
+static void prepare_imu_wom_from_deep_sleep(void)
 {
-    /* Deep sleep GPIO wake on ESP32-S3 must use EXT0/EXT1 (ESP_SLEEP_WAKEUP_GPIO is light sleep only).
-     * Both CST816S INT and HDC2080 INT are active-low (open-drain) => wake on ANY_LOW.
-     * QMI8658 WoM is a toggle output. We configure it to start LOW (CAL1_H) and then
-     * toggle HIGH on motion, so wake on ANY_HIGH for the IMU pin.
-     */
 
-    /* Make sure both wake pins are inputs with pull-ups right before arming EXT1.
-     * (We do this here so it also applies after wake, regardless of earlier init order.)
-     */
-    const gpio_config_t wake_gpio_cfg = {
-        .pin_bit_mask = (1ULL << (int)HDC2080_IRQ) | (1ULL << (int)TOUCH_GPIO_INT),
+    /* Arm IMU Wake-on-Motion */
+    if (s_imu.initialized) {
+        imu_helper_arm_wom(&s_imu);
+        /* Clear status to reset INT line before arming EXT1 */
+        imu_helper_clear_wom_status(&s_imu);
+    }
+
+    /* Configure EXT1 wake source (IMU INT1 only) */
+    uint64_t wake_mask = (1ULL << IMU_INT1_GPIO);
+
+    /* Ensure wake pin is input with pull-up */
+    const gpio_config_t wake_cfg = {
+        .pin_bit_mask = wake_mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_ERROR_CHECK(gpio_config(&wake_gpio_cfg));
+    ESP_ERROR_CHECK(gpio_config(&wake_cfg));
 
-    /* If touch INT is already asserted (low) right now, arming it as an ANY_LOW wake source
-     * will either cause an immediate wake-loop or make it look like touch never wakes.
-     * In that case, fall back to only HDC2080 for this sleep cycle.
-     */
-    uint64_t mask = (1ULL << (int)HDC2080_IRQ) | (1ULL << (int)TOUCH_GPIO_INT);
-    const int touch_lvl = gpio_get_level(TOUCH_GPIO_INT);
-    if (touch_lvl == 0)
-    {
-        ESP_LOGW(TAG, "[SLEEP] Touch INT already LOW; excluding touch from EXT1 mask for this cycle");
-        mask &= ~(1ULL << (int)TOUCH_GPIO_INT);
-    }
-
+    /* Disable all wake sources first, then enable EXT1 */
     ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
-#else
-    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW));
-#endif
-
-    ESP_LOGI(TAG, "[SLEEP] EXT1 wake armed mask=0x%016" PRIx64 " ANY_LOW", mask);
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW));
+    ESP_LOGI(TAG, "Deep sleep prepared: EXT1 mask=0x%016" PRIx64 " (IMU only)", wake_mask);
 }
 
+/* =========================================================
+ * TOUCH IRQ HANDLING FOR APP_MAIN LOOP
+ * ========================================================= */
+static SemaphoreHandle_t s_touch_irq_sem = NULL;
 
-static void app_runtime_diag_task(void* arg)
+static void IRAM_ATTR touch_irq_isr(void *arg)
 {
     (void)arg;
-    while (1)
-    {
-        ESP_LOGI(TAG, ".");
-        vTaskDelay(pdMS_TO_TICKS(5000));
+    if (s_touch_irq_sem) {
+        BaseType_t high_task_wake = pdFALSE;
+        xSemaphoreGiveFromISR(s_touch_irq_sem, &high_task_wake);
+        if (high_task_wake) portYIELD_FROM_ISR();
     }
 }
-
-static esp_err_t app_lcd_apply_gap_for_rotation(lv_display_rotation_t rot)
-{
-    int x_off;
-    int y_off;
-
-    /* Gap is a panel RAM-window quirk; we tie it to portrait vs landscape orientation. */
-    if (rot == LV_DISPLAY_ROTATION_90 || rot == LV_DISPLAY_ROTATION_270)
-    {
-        x_off = LCD_LANDSCAPE_X_OFFSET;
-        y_off = LCD_LANDSCAPE_Y_OFFSET;
-    }
-    else
-    {
-        x_off = LCD_PORTRAIT_X_OFFSET;
-        y_off = LCD_PORTRAIT_Y_OFFSET;
-    }
-
-    ESP_LOGI(TAG, "[LCD] set_gap for rotation=%d -> x=%d y=%d", (int)rot, x_off, y_off);
-    return esp_lcd_panel_set_gap(lcd_panel, x_off, y_off);
-}
-
-static void app_apply_rotation(lv_display_rotation_t rot)
-{
-    if (lvgl_disp == NULL || lcd_panel == NULL)
-    {
-        return;
-    }
-
-    if (app_lcd_apply_gap_for_rotation(rot) != ESP_OK)
-    {
-        ESP_LOGW(TAG, "[LCD] set_gap failed for rotation=%d", (int)rot);
-    }
-
-    /* LVGL will rotate rendering + input mapping automatically. */
-    lv_display_set_rotation(lvgl_disp, rot);
-}
-
-static void app_touch_dot_timer_cb(lv_timer_t* t)
-{
-    (void)t;
-
-    if (touch_dot == NULL || lvgl_touch_indev == NULL)
-    {
-        return;
-    }
-
-    /* This is LVGL's final (rotation-aware) pointer point */
-    lv_point_t p;
-    lv_indev_get_point(lvgl_touch_indev, &p);
-
-    const lv_indev_state_t st = lv_indev_get_state(lvgl_touch_indev);
-    const bool pressed = (st == LV_INDEV_STATE_PRESSED);
-
-    app_touch_dot_update((int32_t)p.x, (int32_t)p.y, pressed);
-}
-
-static void app_touch_dot_update(int32_t x, int32_t y, bool pressed)
-{
-    if (touch_dot == NULL || lvgl_disp == NULL)
-    {
-        return;
-    }
-
-    lvgl_port_lock(0);
-
-    if (!pressed)
-    {
-        lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
-        lvgl_port_unlock();
-        return;
-    }
-
-    /*
-     * x/y must be in the CURRENT UI coordinate space.
-     * (i.e. already rotation-aware, as returned by lv_indev_get_point())
-     */
-    int32_t w = lv_display_get_horizontal_resolution(lvgl_disp);
-    int32_t h = lv_display_get_vertical_resolution(lvgl_disp);
-
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x > w - 1) x = w - 1;
-    if (y > h - 1) y = h - 1;
-
-    int32_t dot_w = (int32_t)lv_obj_get_width(touch_dot);
-    int32_t dot_h = (int32_t)lv_obj_get_height(touch_dot);
-
-    lv_obj_clear_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(touch_dot, x - dot_w / 2, y - dot_h / 2);
-
-    lvgl_port_unlock();
-}
-
-// HDC 2080 TEMP SENSOR
-// #define HDC2080_ADDR 0x40
-
-
-/* =========================================================
- * MAIN
- * ========================================================= */
-
-/* =========================================================
- * HDC2080 TEMP SENSOR
- * ========================================================= */
-static esp_err_t app_hdc2080_init(void)
-{
-    hdc2080_handle_t h = NULL;
-    hdc2080_config_t cfg = {
-        .i2c_bus = i2c_bus_handle,
-        .i2c_addr = 0x40,
-        .i2c_timeout_ms = 1000,
-
-        .int_gpio = HDC2080_IRQ,
-        .int_polarity = HDC2080_INT_ACTIVE_LOW, // same as ACTIVE_LOW=true
-        .int_pull = HDC2080_INT_PULLUP, // same as USE_INTERNAL_PULL=true + ACTIVE_LOW
-
-        .amm_rate = HDC2080_AMM_1HZ,
-        .meas_wait_ms = 30,
-        .deassert_wait_ms = 200,
-
-        .debounce_ms = 30,
-    };
-
-    ESP_ERROR_CHECK(hdc2080_init(&cfg, &h));
-
-    // Optional: dump configuration for verification
-    ESP_ERROR_CHECK(hdc2080_dump_config(h));
-
-    // Clear any stale status after reset/wake
-    hdc2080_status_t st0 = {0};
-    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st0));
-    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) after wake/init: 0x%02X (TH=%d TL=%d)",
-             st0.raw, (int)st0.th, (int)st0.tl);
-
-    // 2) Baseline measure
-    hdc2080_measurement_t m = {0};
-    ESP_ERROR_CHECK(hdc2080_measure_temp_humidity(h, true /*temp_only*/, &m));
-    ESP_LOGI(TAG, "Baseline temp: %.2f C", (double)m.temp_c);
-
-    // Update UI once before sleep (humidity not measured in temp_only mode)
-    app_temp_display_update(m.temp_c, 0.0f, true);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    // 3) Decide and arm. Example chooses rising threshold (TH): baseline + delta
-    const bool want_rising = true;
-
-
-    if (want_rising)
-    {
-        ESP_ERROR_CHECK(hdc2080_arm_irq(h, HDC2080_IRQ_TH, m.temp_c, TEMP_DELTA_WAKE_C));
-        ESP_LOGI(TAG, "RAISING - Baseline: %.2f C, new target temp %.2f",
-                 (double)m.temp_c,
-                 (double)(m.temp_c + TEMP_DELTA_WAKE_C));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "FALLING - Baseline: %.2f C, new target temp %.2f",
-                 (double)m.temp_c,
-                 (double)(m.temp_c - TEMP_DELTA_WAKE_C));
-
-        ESP_ERROR_CHECK(hdc2080_arm_irq(h, HDC2080_IRQ_TL, m.temp_c, TEMP_DELTA_WAKE_C));
-    }
-
-    // Clear again so we don't immediately wake from a latched flag
-    hdc2080_status_t st1 = {0};
-    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st1));
-    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) after arming: 0x%02X (TH=%d TL=%d)",
-             st1.raw, (int)st1.th, (int)st1.tl);
-
-    // Confirm INT pin is inactive before enabling GPIO wake + deep sleep.
-    // For ACTIVE_LOW, inactive means GPIO reads HIGH.
-    if (hdc2080_int_is_asserted(h))
-    {
-        ESP_LOGW(TAG, "HDC2080 INT is still asserted before sleep (GPIO%d level=%d). "
-                 "Either still above TH, status not cleared, or polarity/wiring issue.",
-                 (int)HDC2080_IRQ, gpio_get_level(HDC2080_IRQ));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "HDC2080 INT inactive before sleep (GPIO%d level=%d)",
-                 (int)HDC2080_IRQ, gpio_get_level(HDC2080_IRQ));
-    }
-
-    // One more read-to-clear right before sleeping to avoid getting stuck asserted.
-    hdc2080_status_t st2 = {0};
-    ESP_ERROR_CHECK(hdc2080_read_and_clear_status(h, &st2));
-    ESP_LOGI(TAG, "HDC2080 INT_STATUS(0x04) before deep sleep: 0x%02X (TH=%d TL=%d)",
-             st2.raw, (int)st2.th, (int)st2.tl);
-
-    return ESP_OK;
-}
-
-/* =========================================================
- * POWER SAVING (ALL-IN-ONE) – keep at end of file
- *
- * Goal:
- *  - Minimize board leakage before deep sleep
- *  - Preserve wake from CST816S INT (GPIO21) and HDC2080 INT (GPIO15)
- *  - Avoid ISR contention / wake loops if a wake pin is already asserted
- *
- * Notes:
- *  - Board-level 3V3 peripherals (buck IQ, LCD VDD rail, sensors) can dominate current.
- *  - We can still reduce current by putting peripherals into sleep/suspend and
- *    ensuring GPIOs aren’t sourcing/sinking current.
- *
- * This is a single function on purpose (per request).
- * ========================================================= */
-static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool keep_hdc_wake)
-{
-    // /* --- 0) Quiesce runtime IRQ-driven touch reads (prevents WDT issues) --- */
-    (void)gpio_intr_disable(TOUCH_GPIO_INT);
-    if (touch_irq_sem)
-    {
-        (void)xSemaphoreTake(touch_irq_sem, 0);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-
-    /* Touch controller: enter deep sleep / low power mode.
-     * The INT pin stays wired to the ESP32 for wake (EXT1 ANY_LOW).
-     */
-    if (touch_handle)
-    {
-        esp_err_t tr = esp_lcd_touch_cst816s_enter_sleep(touch_handle);
-        ESP_LOGI(TAG, "[TOUCH] enter_sleep -> %s", esp_err_to_name(tr));
-        if (tr != ESP_OK)
-        {
-            ESP_LOGW(TAG, "[SLEEP] CST816S enter sleep failed: %s", esp_err_to_name(tr));
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    // 2) LCD off (backlight first, then controller) --- #1#
-    gpio_set_level(LCD_GPIO_BL, !LCD_BL_ON_LEVEL);
-    gpio_hold_en(LCD_GPIO_BL);  // Hold backlight OFF state during deep sleep
-    if (lcd_panel)
-    {
-        (void)esp_lcd_panel_disp_on_off(lcd_panel, false);
-        (void)esp_lcd_panel_disp_sleep(lcd_panel, true);
-
-        vTaskDelay(pdMS_TO_TICKS(120));
-        ESP_LOGI(TAG, "[LCD] panel_disp_sleep(true)");
-    }
-
-    /* QMI8658 WoM:
-     * ESP32-S3 EXT1 uses a SINGLE wake polarity for all pins. Touch + HDC are active-low => ANY_LOW.
-     * Therefore configure WoM initial level HIGH, so motion toggles INT LOW (ANY_LOW wake).
-     */
-    const qmi8658_wom_config_t wom_cfg = {
-        .int_pin = QMI8658_INT_PIN1,
-        .initial_level = QMI8658_WOM_INITIAL_LEVEL_HIGH,
-        .threshold_mg = QMI8658_WOM_THRESHOLD_DEFAULT,
-        .blanking_samples = 3,
-    };
-
-    esp_err_t wr = qmi8658_enable_wake_on_motion_cfg(&s_qmi8658, &wom_cfg);
-    if (wr != ESP_OK)
-    {
-        ESP_LOGW(TAG, "[SLEEP] QMI8658 enable WoM failed: %s", esp_err_to_name(wr));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "[SLEEP] QMI8658 WoM enabled (INT%u initial HIGH -> toggles LOW) thr=%u blank=%u",
-                 (unsigned)wom_cfg.int_pin, (unsigned)wom_cfg.threshold_mg, (unsigned)wom_cfg.blanking_samples);
-    }
-
-    uint64_t mask_low = 0;
-
-    //if (keep_touch_wake) mask_low |= (1ULL << (int)TOUCH_GPIO_INT);
-    if (keep_hdc_wake) mask_low |= (1ULL << (int)HDC2080_IRQ);
-    mask_low |= (1ULL << (int)IMU_INT1_GPIO);
-
-    // Ensure wake pins are inputs with pull-ups (ANY_LOW inactive level = HIGH).
-    gpio_config_t wake_cfg = {
-        .pin_bit_mask = 0,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    wake_cfg.pin_bit_mask = mask_low;
-    if (wake_cfg.pin_bit_mask)
-    {
-        ESP_ERROR_CHECK(gpio_config(&wake_cfg));
-    }
-
-    // Clear STATUS1 right before arming EXT1 so the IMU INT returns to initial level.
-    // Reading STATUS1 is the ONLY datasheet-defined way to reset the WoM toggle output.
-    (void)qmi8658_wom_clear_status(&s_qmi8658);
-
-
-
-    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
-
-    if (mask_low)
-    {
-        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask_low, ESP_EXT1_WAKEUP_ANY_LOW));
-    }
-    else
-    {
-        ESP_LOGE(TAG, "[SLEEP] EXT1 mask is empty after sanitizing; refusing to enter deep sleep");
-        return;
-    }
-
-    ESP_LOGI(TAG, "[SLEEP] Entering deep sleep; EXT1 mask=0x%016" PRIx64 " ANY_LOW", mask_low);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    esp_deep_sleep_start();
-}
-
-
-//---------------------------------------------------------------------------------------------------------------
-// APP MAIN
-//---------------------------------------------------------------------------------------------------------------
 
 void app_main(void)
 {
     esp_log_level_set(TAG, ESP_LOG_INFO);
-    ESP_LOGI(TAG, "[APP] Starting...");
+    ESP_LOGI(TAG, "\n\n========== CST816S + HDC2080 + QMI8658 + IMU WAKE TEST ==========\n");
 
-    //#define TOUCH_DISPLAY_DEMO
-#ifdef TOUCH_DISPLAY_DEMO
-    ESP_LOGI(TAG, "[APP] Touch display demo");
-    touch_irq_sem = xSemaphoreCreateBinary();
-    if (!touch_irq_sem)
-    {
-        ESP_LOGE(TAG, "Failed to create touch semaphore");
-        return;
+    int loop_count = 0;
+
+    while (1) {
+        loop_count++;
+        ESP_LOGI(TAG, "\n\n========== ITERATION %d ==========\n", loop_count);
+
+
+
+        /* ===== STEP 1: INIT I2C ===== */
+        ESP_LOGI(TAG, "[1/5] INIT I2C BUS");
+
+        gpio_hold_dis(TOUCH_I2C_SDA);
+        gpio_hold_dis(TOUCH_I2C_SCL);
+        gpio_hold_dis(TOUCH_RST_PIN);
+        gpio_hold_dis(TOUCH_GPIO_INT);
+        gpio_hold_dis(IMU_INT1_GPIO);
+
+        const gpio_config_t rst_cfg = {
+            .pin_bit_mask = 1ULL << TOUCH_RST_PIN,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&rst_cfg));
+        gpio_set_level(TOUCH_RST_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        gpio_reset_pin(TOUCH_I2C_SDA);
+        gpio_reset_pin(TOUCH_I2C_SCL);
+        gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_PULLUP_ONLY);
+        gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+        gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        const gpio_config_t int_cfg = {
+            .pin_bit_mask = 1ULL << TOUCH_GPIO_INT,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&int_cfg));
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        gpio_set_level(TOUCH_RST_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level(TOUCH_RST_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ESP_LOGI(TAG, "  ✓ I2C bus ready, CST816S reset complete\n");
+
+        // Create I2C master bus
+        // NOTE: Consider adding a bounded timeout in production builds; this demo uses -1 (wait forever)
+        // in some I2C calls below. A stuck bus can block forever.
+        const i2c_master_bus_config_t i2c_cfg = {
+            .i2c_port = I2C_NUM,
+            .sda_io_num = TOUCH_I2C_SDA,
+            .scl_io_num = TOUCH_I2C_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .flags.enable_internal_pullup = true,
+        };
+
+        i2c_master_bus_handle_t i2c_bus = NULL;
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_cfg, &i2c_bus));
+
+        // Add CST816S touch device
+        i2c_master_dev_handle_t cst_dev = NULL;
+        i2c_device_config_t cst_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = 0x15,
+            .scl_speed_hz = 100000,
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &cst_cfg, &cst_dev));
+
+        // Add HDC2080 device
+        i2c_master_dev_handle_t hdc_dev = NULL;
+        i2c_device_config_t hdc_cfg_i2c = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = 0x40,  // HDC2080 address
+            .scl_speed_hz = 100000,
+        };
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &hdc_cfg_i2c, &hdc_dev));
+
+        // Configure IMU INT1 pin (wake source)
+        const gpio_config_t imu_int_cfg = {
+            .pin_bit_mask = 1ULL << IMU_INT1_GPIO,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&imu_int_cfg));
+
+        // ...initialize QMI8658 IMU with qmi8658_init...
+        qmi8658_dev_t qmi_dev = {0};
+        esp_err_t imu_ret = qmi8658_init(&qmi_dev, i2c_bus, 0x6B);  // Try primary address
+        bool imu_found = (imu_ret == ESP_OK);
+        if (!imu_found) {
+            imu_ret = qmi8658_init(&qmi_dev, i2c_bus, 0x6A);  // Try alternate address
+            imu_found = (imu_ret == ESP_OK);
+        }
+
+        if (imu_found) {
+            ESP_LOGI(TAG, "  ✓ QMI8658 initialized");
+        } else {
+            ESP_LOGW(TAG, "  ⚠ QMI8658 NOT FOUND on I2C bus");
+        }
+        ESP_LOGI(TAG, "  ✓ All devices added to I2C bus\n");
+
+        /* ===== STEP 1b: INIT LCD & LVGL ===== */
+        ESP_LOGI(TAG, "[1b/5] INIT LCD & LVGL");
+        // Logging suggestion (keep bring-up easy): after init, it's helpful to log the key handles are non-NULL:
+        //  - s_lcd.panel, s_lcd.io (inside lcd_helper_handle_t)
+        //  - s_lvgl_disp, s_lvgl_touch
+
+        ESP_ERROR_CHECK(init_lcd());
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        ESP_ERROR_CHECK(init_lvgl());
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        ESP_LOGI(TAG, "  ✓ Display initialized\n");
+
+        /* ===== STEP 2: READ SENSORS ===== */
+        ESP_LOGI(TAG, "[2/5] READ SENSORS");
+
+
+        // Read CST816S ID
+        uint8_t id_reg = 0xA7;
+        uint8_t id_val = 0;
+        esp_err_t ret = i2c_master_transmit_receive(cst_dev, &id_reg, 1, &id_val, 1, -1);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  ✓ CST816S ID = 0x%02X", id_val);
+        } else {
+            ESP_LOGE(TAG, "  ✗ CST816S READ FAILED: %s", esp_err_to_name(ret));
+        }
+
+        // Read HDC2080 temperature
+        float temp_c = 0.0f;
+        bool temp_ok = false;
+        uint8_t meas_cfg_reg = 0x0F;  // MEAS_CFG register
+        uint8_t meas_cfg_val = 0x01;  // Trigger measurement (MEAS_TRIG bit)
+        ret = i2c_master_transmit(hdc_dev, (uint8_t[]){meas_cfg_reg, meas_cfg_val}, 2, -1);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "  ✗ HDC2080 TRIG FAILED: %s", esp_err_to_name(ret));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // Wait for measurement
+
+        // Read temperature from HDC2080 (TEMP_L = 0x00)
+        uint8_t temp_l_reg = 0x00;
+        uint8_t temp_data[2];
+        ret = i2c_master_transmit_receive(hdc_dev, &temp_l_reg, 1, temp_data, 2, -1);
+        if (ret == ESP_OK) {
+            uint16_t raw_temp = ((uint16_t)temp_data[1] << 8) | temp_data[0];
+            temp_c = ((float)raw_temp * 165.0f / 65536.0f) - 40.5f;
+            temp_ok = true;
+            ESP_LOGI(TAG, "  ✓ HDC2080 TEMP = %.2f °C (raw=0x%04X)", temp_c, raw_temp);
+        } else {
+            ESP_LOGE(TAG, "  ✗ HDC2080 READ FAILED: %s", esp_err_to_name(ret));
+        }
+
+        // Read QMI8658 IMU acceleration
+        if (imu_found) {
+            float ax = 0.0f, ay = 0.0f, az = 0.0f;
+            ret = qmi8658_read_accel(&qmi_dev, &ax, &ay, &az);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "  ✓ QMI8658 ACCEL = (%.2f, %.2f, %.2f) g", ax, ay, az);
+            } else {
+                ESP_LOGE(TAG, "  ✗ QMI8658 READ FAILED: %s", esp_err_to_name(ret));
+            }
+        } else {
+            ESP_LOGW(TAG, "  ⚠ QMI8658 NOT FOUND on I2C bus");
+        }
+        ESP_LOGI(TAG, "");
+
+        /* ===== STEP 2b: SHOW TEMPERATURE AND WAKEUP REASON ON DISPLAY ===== */
+        ESP_LOGI(TAG, "[2b/5] DISPLAY TEMPERATURE");
+        ui_init();
+        ui_update(WAKE_OTHER, temp_c, temp_ok);
+        ESP_LOGI(TAG, "  ✓ UI updated with sensor data\n");
+
+        /* Wait for CST816S touch IRQ */
+        if (!s_touch_irq_sem) {
+            s_touch_irq_sem = xSemaphoreCreateBinary();
+            esp_err_t isr_ret = gpio_install_isr_service(0);
+            ESP_LOGI(TAG, "GPIO ISR service install: %s", esp_err_to_name(isr_ret));
+        }
+
+        /* Configure INT pin interrupt on falling edge */
+        ESP_LOGI(TAG, "Touch INT level before enable: %d", gpio_get_level(TOUCH_GPIO_INT));
+        ESP_ERROR_CHECK(gpio_set_intr_type(TOUCH_GPIO_INT, GPIO_INTR_NEGEDGE));
+        ESP_ERROR_CHECK(gpio_isr_handler_add(TOUCH_GPIO_INT, touch_irq_isr, NULL));
+        ESP_ERROR_CHECK(gpio_intr_enable(TOUCH_GPIO_INT));
+
+        ESP_LOGI(TAG, "Waiting for CST816S touch IRQ...");
+        // NOTE: If this blocks forever, either:
+        xSemaphoreTake(s_touch_irq_sem, portMAX_DELAY);
+        gpio_isr_handler_remove(TOUCH_GPIO_INT);
+        ESP_LOGI(TAG, "Touch IRQ received!\n");
+
+
+        //==========================================================================================================
+        // DEEP SLEEP PREPARATION
+        //==========================================================================================================
+
+
+        /* ===== STEP 3: SEND Touch CST816S TO SLEEP ===== */
+        ESP_LOGI(TAG, "[3/5] SEND CST816S Touch TO SLEEP");
+        // CST816S sleep command: 0xA5 0x03
+        // Best-effort: if the touch controller brownouts or is already asleep, this can fail.
+        uint8_t sleep_cmd[2] = {0xA5, 0x03};
+        ret = i2c_master_transmit(cst_dev, sleep_cmd, 2, -1);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  ✓ Sleep command sent");
+        } else {
+            ESP_LOGE(TAG, "  ✗ FAILED: %s", esp_err_to_name(ret));
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        ESP_LOGI(TAG, "[3/5] SEND Display & Backlight TO SLEEP");
+        // Power intent:
+        //  - Backlight GPIO is driven to OFF and held across deep sleep.
+        //  - Panel is asked to go to sleep via esp_lcd panel ops.
+        // Note: esp_lcd_* calls here are cast to (void); for bring-up you may want to log their return values.
+        gpio_set_level(s_lcd.gpio_bl, !s_lcd.bl_on_level);
+        gpio_hold_en(s_lcd.gpio_bl);
+
+        // Bring-up visibility: capture and log return values.
+        // (We still proceed to deep sleep either way; logging only.)
+        esp_err_t lcd_off_ret = esp_lcd_panel_disp_on_off(s_lcd.panel, false);
+        if (lcd_off_ret == ESP_OK) {
+            ESP_LOGI(TAG, "  ✓ esp_lcd_panel_disp_on_off(false) OK");
+        } else {
+            ESP_LOGW(TAG, "  ⚠ esp_lcd_panel_disp_on_off(false) failed: %s", esp_err_to_name(lcd_off_ret));
+        }
+
+        esp_err_t lcd_sleep_ret = esp_lcd_panel_disp_sleep(s_lcd.panel, true);
+        if (lcd_sleep_ret == ESP_OK) {
+            ESP_LOGI(TAG, "  ✓ esp_lcd_panel_disp_sleep(true) OK");
+        } else {
+            ESP_LOGW(TAG, "  ⚠ esp_lcd_panel_disp_sleep(true) failed: %s", esp_err_to_name(lcd_sleep_ret));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_LOGI(TAG, "Entered sleep mode");
+
+
+        /* ===== STEP 4: SETUP IMU WAKE-ON-MOTION (while I2C is still active) ===== */
+        ESP_LOGI(TAG, "[4/5] SETUP IMU WAKE-ON-MOTION");
+
+        const qmi8658_wom_config_t wom_cfg = {
+            .int_pin = QMI8658_INT_PIN1,
+            .initial_level = QMI8658_WOM_INITIAL_LEVEL_HIGH,
+            .threshold_mg = 20,  // WoM threshold in mg
+            .blanking_samples = 3,
+        };
+
+        esp_err_t wom_ret = qmi8658_enable_wake_on_motion_cfg(&qmi_dev, &wom_cfg);
+        if (wom_ret == ESP_OK) {
+            ESP_LOGI(TAG, "  ✓ WoM configured (threshold=20 mg)");
+        } else {
+            ESP_LOGE(TAG, "  ✗ WoM config failed: %s", esp_err_to_name(wom_ret));
+        }
+
+        // Clear WoM status to reset INT line
+        qmi8658_wom_clear_status(&qmi_dev);
+        ESP_LOGI(TAG, "  ✓ WoM status cleared, INT pin reset\n");
+
+        /* ===== STEP 5: CLEANUP I2C ===== */
+        ESP_LOGI(TAG, "[5/5] CLEANUP I2C AND PREPARE SLEEP");
+
+        i2c_master_bus_rm_device(cst_dev);
+        i2c_master_bus_rm_device(hdc_dev);
+
+        if (imu_found && qmi_dev.dev_handle != NULL) {
+            i2c_master_bus_rm_device(qmi_dev.dev_handle);
+        }
+
+        ESP_ERROR_CHECK(i2c_del_master_bus(i2c_bus));
+
+        // Configure EXT1 wake source (IMU INT1 only, active-LOW)
+        // EXT1 notes:
+        //  - EXT1 uses one shared polarity for all pins in the mask.
+        //  - Print the wake mask and the pin level right before sleep; it saves a ton of time.
+        uint64_t wake_mask = (1ULL << IMU_INT1_GPIO);
+        const gpio_config_t wake_cfg = {
+            .pin_bit_mask = wake_mask,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&wake_cfg));
+
+        ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW));
+        ESP_LOGI(TAG, "  EXT1 wake configured: GPIO%d (IMU INT1) ANY_LOW", (int)IMU_INT1_GPIO);
+
+        // Prepare PINs for deep sleep:
+        //  - Touch reset held low (keeps touch IC quiescent)
+        //  - I2C pins high-Z + floating, then held (avoid pulling against external devices)
+        //  - gpio_deep_sleep_hold_en() latches digital pad holds through deep sleep
+        // If you still see leakage, consider reviewing which pins are RTC vs digital pads.
+        gpio_set_direction(TOUCH_RST_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level(TOUCH_RST_PIN, 0);
+
+        gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+        gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+        gpio_set_direction(TOUCH_GPIO_INT, GPIO_MODE_INPUT);
+
+        gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_FLOATING);
+        gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_FLOATING);
+        gpio_set_pull_mode(TOUCH_GPIO_INT, GPIO_FLOATING);
+
+        gpio_hold_en(TOUCH_RST_PIN);
+        gpio_hold_en(TOUCH_I2C_SDA);
+        gpio_hold_en(TOUCH_I2C_SCL);
+        gpio_hold_en(TOUCH_GPIO_INT);
+
+        // Ensure GPIO hold is latched during deep sleep (required for digital GPIO hold)
+        gpio_deep_sleep_hold_en();
+
+        ESP_LOGI(TAG, "Entering deep sleep...");
+        // Final sanity logs can help diagnose instant-wake loops.
+        // (No behavior changes; just visibility.)
+        ESP_LOGI(TAG, "Final pin levels before sleep: IMU_INT1=%d TOUCH_INT=%d SDA=%d SCL=%d RST=%d",
+                 gpio_get_level(IMU_INT1_GPIO),
+                 gpio_get_level(TOUCH_GPIO_INT),
+                 gpio_get_level(TOUCH_I2C_SDA),
+                 gpio_get_level(TOUCH_I2C_SCL),
+                 gpio_get_level(TOUCH_RST_PIN));
+        esp_deep_sleep_start();
+        /* Code will NOT reach here - ESP will wake on IMU motion */
     }
+}
 
-    if (app_lcd_init() != ESP_OK) return;
-    if (app_touch_init() != ESP_OK) return;
-    if (app_lvgl_init() != ESP_OK) return;
+#ifdef no_used
+/* =========================================================
+ * APP MAIN
+ * ========================================================= */
+void app_main_old(void)
+{
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    ESP_LOGI(TAG, "=== Ali-Box Sensor Demo ===");
 
-    xTaskCreate(app_runtime_diag_task, "diag", 3072, NULL, 1, NULL);
-    app_main_display();
-#else
-    /* Temperature + humidity demo */
-    ESP_LOGI(TAG, "Welcome - Ali-Box Sensor ");
-    touch_irq_sem = xSemaphoreCreateBinary();
-    if (!touch_irq_sem)
-    {
-        ESP_LOGE(TAG, "Failed to create touch semaphore");
-        return;
-    }
+    /* 1) Print wakeup reason */
+    wake_cause_t wake = get_wakeup_cause();
+    ESP_LOGI(TAG, "Wakeup reason: %s", wake_cause_str(wake));
 
+    /* Initialize peripherals:
+     * - I2C bus first (with GPIO hold release and touch HW reset)
+     * - Touch init FIRST (CST816S needs undisturbed boot time)
+     * - Then scan I2C bus to verify all devices
+     */
 
-    if (app_touch_init() != ESP_OK) return;
-    vTaskDelay(pdMS_TO_TICKS(100)); // small delay to ensure LCD is ready
-
-    if (app_lcd_init() != ESP_OK) return;
-    vTaskDelay(pdMS_TO_TICKS(100)); // small delay to ensure LCD is ready
-    if (app_lvgl_init() != ESP_OK) return;
-    vTaskDelay(pdMS_TO_TICKS(100)); // small delay to ensure LCD is ready
-    if (app_qmi8658_init_optional() != ESP_OK) return;
-    vTaskDelay(pdMS_TO_TICKS(100)); // small delay to ensure LCD is ready
-    if (app_hdc2080_init() != ESP_OK) return;
-
-    /* Create the temp/humidity UI */
-    app_temp_display_ui_init();
-    app_wakeup_cause_ui_init();
-    ESP_LOGI(TAG, "=== HDC2080 TH/TL IRQ example (ESP-IDF v5.5 component) ===");
-
-    app_wake_debug_dump_ext1();
-
-    /* Determine wakeup cause (best-effort) */
-    app_wake_cause_t wake_ui = APP_WAKE_UNKNOWN;
-    const esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
-    if (wc == ESP_SLEEP_WAKEUP_EXT1)
-    {
-        const uint64_t m = esp_sleep_get_ext1_wakeup_status();
-        if (m & (1ULL << (int)TOUCH_GPIO_INT))
-        {
-            wake_ui = APP_WAKE_TOUCH;
-        }
-        else if (m & (1ULL << (int)HDC2080_IRQ))
-        {
-            wake_ui = APP_WAKE_TEMP_THRESHOLD;
-        }
-        else if (m & (1ULL << (int)IMU_INT1_GPIO))
-        {
-            wake_ui = APP_WAKE_IMU;
-        }
-        else
-        {
-            wake_ui = APP_WAKE_UNKNOWN;
-        }
-    }
-
-    // print wakeup in clear text
-    ESP_LOGI(TAG, "Wakeup cause: %s",
-             (wake_ui == APP_WAKE_TOUCH) ? "Touch" :
-             (wake_ui == APP_WAKE_TEMP_THRESHOLD) ? "Temp threshold" :
-             (wake_ui == APP_WAKE_IMU) ? "Motion (IMU)" :
-             "Unknown");
-
-    app_wakeup_cause_ui_set(wake_ui);
-
-
-
-
-#define USE_UNIFIED_POWER_SAVE_ROUTINE
-#ifndef USE_UNIFIED_POWER_SAVE_ROUTINE
-    ESP_LOGI(TAG, "Entering deep sleep; wake on GPIO: touch GPIO%d low, hdc2080 GPIO%d low",
-             (int)TOUCH_GPIO_INT, (int)HDC2080_IRQ);
-
-    app_display_turn_off();
-    vTaskDelay(pdMS_TO_TICKS(20)); // let the SPI transaction / GPIO settle
-
-    // Give logs time to flush
+    ESP_ERROR_CHECK(init_i2c());
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    ESP_ERROR_CHECK(init_touch());
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+
+    ESP_ERROR_CHECK(init_lcd());
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_ERROR_CHECK(init_lvgl());
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_ERROR_CHECK(init_sensors());
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Clear IMU WoM status if woke from IMU */
+    if (wake == WAKE_IMU && s_imu.initialized) {
+        imu_helper_clear_wom_status(&s_imu);
+    }
+
+    /* 2) Read temperature */
+    float temp_c = 0.0f;
+    bool temp_ok = false;
+    if (s_hdc.initialized) {
+        if (hdc2080_helper_read_temp(&s_hdc, &temp_c, NULL) == ESP_OK) {
+            temp_ok = true;
+            ESP_LOGI(TAG, "Temperature: %.1f C", (double)temp_c);
+        } else {
+            ESP_LOGW(TAG, "Failed to read temperature");
+        }
+    }
+
+    /* 3) Show temperature and wakeup reason on display */
+    ui_init();
+    ui_update(wake, temp_c, temp_ok);
+
+    /* 4) Wait until user touches the display */
+    ESP_LOGI(TAG, "Waiting for touch...");
+    while (!wait_for_touch(60000)) {
+        /* Keep waiting (timeout just for safety) */
+        ESP_LOGI(TAG, "Still waiting for touch...");
+    }
+    ESP_LOGI(TAG, "Touch detected!");
+
+    /* Small delay for visual feedback */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+     /******************************+  5) When touched: prepare deep sleep *********************************************
+     *
+     */
+    ESP_LOGI(TAG, "Preparing for deep sleep (IMU wake only)...");
+    prepare_imu_wom_from_deep_sleep();
+
+    /* Disable touch runtime IRQ */
+    touch_helper_disable_irq(&s_touch);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* Put touch controller to sleep */
+    touch_helper_enter_sleep(&s_touch);
+
+    /* Hold touch controller in reset (optional, but safe). */
+    gpio_set_direction(TOUCH_RST_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(TOUCH_RST_PIN, 0);
+    gpio_hold_en(TOUCH_RST_PIN);
+
+
+    /* Turn off LCD */
+    lcd_helper_enter_sleep(&s_lcd);
+
+    /* Make I2C + INT pins high-Z (input, floating). */
+    gpio_set_direction(TOUCH_I2C_SDA, GPIO_MODE_INPUT);
+    gpio_set_direction(TOUCH_I2C_SCL, GPIO_MODE_INPUT);
+    gpio_set_direction(TOUCH_GPIO_INT, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(TOUCH_I2C_SDA, GPIO_FLOATING);
+    gpio_set_pull_mode(TOUCH_I2C_SCL, GPIO_FLOATING);
+    gpio_set_pull_mode(TOUCH_GPIO_INT, GPIO_FLOATING);
+    gpio_hold_en(TOUCH_I2C_SDA);
+    gpio_hold_en(TOUCH_I2C_SCL);
+    gpio_hold_en(TOUCH_GPIO_INT);
+
+    /* Let logs flush */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* 6) Go into deep sleep */
+    ESP_LOGI(TAG, "Entering deep sleep...");
     esp_deep_sleep_start();
-#else
-
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "Entering deep sleep via unified power-save routine");
-    app_power_save_shutdown_and_sleep_ext1(true /*touch*/, true /*hdc2080*/);
-
-    // On wake, execution restarts from app_main().
-    // Typical pattern: check wake cause, read/clear status, measure, re-arm, sleep again.
-
-#endif
-#endif
+    ESP_LOGI(TAG, "This will never be printed - ESP is now sleeping and will wake on IMU motion");
 }
+#endif
+/* =========================================================
+ * UNUSED FUNCTIONS (kept for future use)
+ * ========================================================= */
+
+/* NOTE: app_runtime_diag_task - diagnostic task for debugging, not used in current flow */
+/*
+static void app_runtime_diag_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        ESP_LOGI(TAG, ".");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+*/
+
+/* NOTE: app_main_display - touch demo UI with rotation button, not used in current flow */
+/*
+static void app_main_display(void)
+{
+    // Demo UI with logo, touch dot, and rotation button
+}
+*/
+
+/* NOTE: app_touch_dot_update - touch dot visualizer, not used in current flow */
+/*
+static void app_touch_dot_update(int32_t x, int32_t y, bool pressed)
+{
+    // Update touch dot position
+}
+*/
+
+/* NOTE: app_note_activity - activity tracker for display timeout, not used in current flow */
+/*
+static void app_note_activity(wake_cause_t cause, TickType_t *last_activity_ticks)
+{
+    // Track activity for display timeout
+}
+*/
+
+/* NOTE: app_configure_gpio_wakeup_sources - GPIO wake config (replaced by prepare_deep_sleep_imu_only) */
+/*
+static void app_configure_gpio_wakeup_sources(void)
+{
+    // Configure touch + HDC2080 as GPIO wake sources
+}
+*/
+
+/* NOTE: app_prepare_for_deep_sleep - legacy sleep prep (replaced by prepare_deep_sleep_imu_only) */
+/*
+static void app_prepare_for_deep_sleep(void)
+{
+    // Legacy deep sleep preparation
+}
+*/
+
+/* NOTE: app_power_save_shutdown_and_sleep_ext1 - unified power save routine, not used in current flow */
+/*
+static void app_power_save_shutdown_and_sleep_ext1(bool keep_touch_wake, bool keep_hdc_wake)
+{
+    // Full power save with optional touch/HDC wake sources
+}
+*/
+
+/* NOTE: app_wake_debug_dump_ext1 - debug EXT1 wake status, not used in current flow */
+/*
+static void app_wake_debug_dump_ext1(void)
+{
+    // Debug: dump EXT1 wake mask and pin levels
+}
+*/
+
+/* NOTE: app_sleep_debug_dump_pins - debug pin levels before sleep, not used in current flow */
+/*
+static void app_sleep_debug_dump_pins(void)
+{
+    // Debug: dump wake pin levels
+}
+*/
+
+/* NOTE: app_hdc2080_init - full HDC2080 init with temp threshold arming, not used in current flow */
+/*
+static esp_err_t app_hdc2080_init(void)
+{
+    // Full HDC2080 init with temperature threshold arming
+}
+*/
+
+/* NOTE: app_qmi8658_init_optional - legacy IMU init, replaced by imu_helper_init */
+/*
+static esp_err_t app_qmi8658_init_optional(void)
+{
+    // Legacy QMI8658 init
+}
+*/

@@ -150,3 +150,8 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+/managed_components/
+/build/
+/cmake-build-debug/
+/cmake-build-default/
+/cmake-build-esp-idf/
