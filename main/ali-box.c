@@ -665,6 +665,7 @@ static void IRAM_ATTR touch_irq_isr(void *arg)
     }
 }
 
+
 void app_main(void)
 {
     esp_log_level_set(TAG, ESP_LOG_INFO);
